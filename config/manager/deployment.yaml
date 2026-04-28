@@ -28,7 +28,9 @@ spec:
         image: controller:dev    # 由 kustomize edit set image 替换
         imagePullPolicy: IfNotPresent
         args:
-          - --leader-elect=true
+          # M1 阶段单副本，关掉 leader-election；后续多副本 HA 时翻回 true
+          # 即可（配合下面 RBAC 里 configmaps + leases 权限自动生效）。
+          - --leader-elect=false
           - --metrics-bind-address=:8080
           - --health-probe-bind-address=:8081
           - --init-image=$(VNTOPO_INIT_IMAGE)

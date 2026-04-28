@@ -23,6 +23,12 @@ rules:
 - apiGroups: [""]
   resources: [events]
   verbs: [create, patch]
+# 下面两组是给 leader election 用的：
+#   · controller-runtime v0.11 默认锁是 "configmapsleases"（双写 ConfigMap + Lease）
+#   · 即使 --leader-elect=false，留着也无害，方便以后 HA 开启
+- apiGroups: [""]
+  resources: [configmaps]
+  verbs: [get, list, watch, create, update, patch, delete]
 - apiGroups: [coordination.k8s.io]
   resources: [leases]
   verbs: [get, list, watch, create, update, patch, delete]
