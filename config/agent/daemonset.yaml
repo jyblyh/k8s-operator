@@ -58,11 +58,12 @@ spec:
             - name: host-netns
               mountPath: /var/run/netns
               mountPropagation: HostToContainer
-            - name: containerd-sock
-              mountPath: /run/containerd/containerd.sock
-            - name: cri-sandboxes
-              mountPath: /run/containerd/io.containerd.grpc.v1.cri/sandboxes
-              mountPropagation: HostToContainer
+            # M2/M3 真正建链时再挂载容器运行时 socket。当前集群是 Docker（v1.21）：
+            #   - name: docker-sock
+            #     mountPath: /var/run/docker.sock
+            #   - name: host-proc
+            #     mountPath: /host/proc
+            #     mountPropagation: HostToContainer
           resources:
             requests: { cpu: 50m,  memory: 64Mi }
             limits:   { cpu: 500m, memory: 256Mi }
@@ -75,11 +76,8 @@ spec:
           hostPath:
             path: /var/run/netns
             type: DirectoryOrCreate
-        - name: containerd-sock
-          hostPath:
-            path: /run/containerd/containerd.sock
-            type: Socket
-        - name: cri-sandboxes
-          hostPath:
-            path: /run/containerd/io.containerd.grpc.v1.cri/sandboxes
-            type: DirectoryOrCreate
+        # M2/M3 时配套上面 volumeMounts 解开：
+        #   - name: docker-sock
+        #     hostPath: { path: /var/run/docker.sock, type: Socket }
+        #   - name: host-proc
+        #     hostPath: { path: /proc, type: Directory }

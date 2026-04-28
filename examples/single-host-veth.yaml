@@ -1,9 +1,16 @@
 # 示例：同节点两个 host 通过 veth 直连
 #
-# 验证目标：M1 单节点 veth 闭环
+# 验证目标：M1 单节点闭环
+#   · controller 看到 VNode 会创建对应同名 Pod，并按 nodeSelector 调度到 worker1
+#   · M1 阶段链路本身还没建（init 容器拨 agent 会失败 → Pod 进 Init:CrashLoopBackOff）
+#     先把 init 注入临时关掉，只验证 Pod 能被创建到正确节点。等 M2 实装 agent
+#     的 SetupLinks 后再开 init，那时 ping 才能通。
+#
+# M1 验证步骤：
 #   kubectl apply -f examples/single-host-veth.yaml
-#   kubectl wait --for=condition=PodReady pod/host1 -n demo --timeout=60s
-#   kubectl exec -n demo host1 -- ping -c 3 10.0.0.2
+#   kubectl -n demo get pods -o wide   # 期望：host1 / host2 都调度到 k8s-large-1665988239
+#   kubectl get vn -n demo             # 期望：role / dc / phase 列填好
+#   kubectl describe vn host1 -n demo  # 看 status.conditions
 
 ---
 apiVersion: v1
@@ -21,7 +28,7 @@ spec:
   role: host
   dataCenter: dc1
   nodeSelector:
-    kubernetes.io/hostname: aiops-k8s1   # ← 改成你集群中真实的 worker 节点
+    kubernetes.io/hostname: k8s-large-1665988239   # 你集群里的 worker1
   template:
     metadata: {}
     spec:
@@ -47,7 +54,7 @@ spec:
   role: host
   dataCenter: dc1
   nodeSelector:
-    kubernetes.io/hostname: aiops-k8s1
+    kubernetes.io/hostname: k8s-large-1665988239
   template:
     metadata: {}
     spec:

@@ -33,8 +33,9 @@ spec:
           - --health-probe-bind-address=:8081
           - --init-image=$(VNTOPO_INIT_IMAGE)
         env:
+          # 由 Makefile deploy 目标用 sed 替换为 $(IMG_INIT)。
           - name: VNTOPO_INIT_IMAGE
-            value: docker.io/bupt-aiops/vntopo-init:dev
+            value: __INIT_IMAGE__
         ports:
           - name: metrics
             containerPort: 8080

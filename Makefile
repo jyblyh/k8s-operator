@@ -108,7 +108,11 @@ uninstall: $(KUSTOMIZE)                 ## 卸载 CRD
 deploy: manifests $(KUSTOMIZE)          ## 部署 controller + agent + RBAC + namespace
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG_CONTROLLER)
 	cd config/agent   && $(KUSTOMIZE) edit set image agent=$(IMG_AGENT) init=$(IMG_INIT)
-	$(KUSTOMIZE) build config/default | kubectl apply -f -
+	# 把 deployment.yaml 里 VNTOPO_INIT_IMAGE env 占位符替换为最终 init 镜像。
+	# 注意：sed 直接改源文件，commit 前看下 git diff 别误推。
+	$(KUSTOMIZE) build config/default \
+	    | sed "s|__INIT_IMAGE__|$(IMG_INIT)|g" \
+	    | kubectl apply -f -
 
 .PHONY: undeploy
 undeploy: $(KUSTOMIZE)                  ## 卸载所有资源
