@@ -97,7 +97,15 @@ type VNodeSpec struct {
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 
 	// 高级亲和性配置；可与 nodeSelector 叠加，也可单独使用。
+	//
+	// 故意用 Schemaless + PreserveUnknownFields：
+	//   - 让 controller-gen 不要把 corev1.Affinity 展开成几百行的 OpenAPI schema，
+	//     避免 K8s 1.21 的 CRD 校验器解析超大嵌套 schema 时报 unmarshal 错误。
+	//   - 这只影响 CRD schema 校验；Go 侧的反序列化仍然按 corev1.Affinity 严格走。
+	//
 	// +optional
+	// +kubebuilder:validation:Schemaless
+	// +kubebuilder:pruning:PreserveUnknownFields
 	Affinity *corev1.Affinity `json:"affinity,omitempty"`
 
 	// Pod 模板。controller 会在创建 Pod 时注入：
@@ -105,6 +113,11 @@ type VNodeSpec struct {
 	//   · nodeSelector / affinity（来自 spec.nodeSelector / spec.affinity）
 	//   · labels: vntopo.bupt.site/{role,dc,vnode}
 	//   · 一个 init container：vntopo-init
+	//
+	// Schemaless 同上，避免展开 PodTemplateSpec 这棵超大 schema 树。
+	//
+	// +kubebuilder:validation:Schemaless
+	// +kubebuilder:pruning:PreserveUnknownFields
 	Template corev1.PodTemplateSpec `json:"template"`
 
 	// 兼容字段，部分组件读取 pod 主 IP 用。
