@@ -5,7 +5,7 @@ kind: Kustomization
 namespace: vntopo-system
 
 resources:
-  - ../namespace.yaml
+  - ../namespace
   - ../crd
   - ../rbac
   - ../manager
