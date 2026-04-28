@@ -40,7 +40,10 @@ generate: $(CONTROLLER_GEN)             ## 生成 deepcopy 函数
 
 .PHONY: manifests
 manifests: $(CONTROLLER_GEN)            ## 生成 CRD / RBAC YAML
-	$(CONTROLLER_GEN) crd rbac:roleName=vntopo-controller-role webhook \
+	# crd:allowDangerousTypes=true：放行 LinkMetrics / Cost 等 float64 字段
+	# （这些是 ping_exporter/采集器回填的运行时指标，不参与调度，可接受 JSON
+	#  数字跨语言精度差；如果后续要更严格再换成 string 或 resource.Quantity）
+	$(CONTROLLER_GEN) crd:allowDangerousTypes=true rbac:roleName=vntopo-controller-role webhook \
 	    paths="./..." \
 	    output:crd:artifacts:config=config/crd/bases \
 	    output:rbac:artifacts:config=config/rbac
