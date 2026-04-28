@@ -1,0 +1,70 @@
+# 示例：跨节点路由器对接（VXLAN）
+#
+# 拓扑：
+#   r1 (调度到 node1) ────VXLAN───── r2 (调度到 node2)
+#
+# 验证目标：M2 跨节点 VXLAN 闭环
+#   kubectl apply -f examples/cross-host-vxlan.yaml
+#   kubectl wait --for=condition=PodReady pod/r1 -n demo --timeout=120s
+#   kubectl wait --for=condition=PodReady pod/r2 -n demo --timeout=120s
+#   kubectl exec -n demo r1 -- ping -c 3 192.168.0.2
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+
+---
+# r1 强制调度到 node1
+apiVersion: vntopo.bupt.site/v1alpha1
+kind: VNode
+metadata:
+  name: r1
+  namespace: demo
+spec:
+  role: r
+  # 路由器一般不指定 dataCenter，由 K8s 自由调度；
+  # 这个示例为了测试可重复性，显式指定 nodeSelector。
+  nodeSelector:
+    kubernetes.io/hostname: aiops-k8s1
+  template:
+    metadata: {}
+    spec:
+      containers:
+        - name: net
+          image: nicolaka/netshoot:latest
+          command: ["sleep", "infinity"]
+  links:
+    - uid: 100
+      peer_pod: r2
+      local_intf: r1_r2
+      peer_intf:  r2_r1
+      local_ip:   192.168.0.1/24
+      peer_ip:    192.168.0.2/24
+
+---
+# r2 强制调度到 node2
+apiVersion: vntopo.bupt.site/v1alpha1
+kind: VNode
+metadata:
+  name: r2
+  namespace: demo
+spec:
+  role: r
+  nodeSelector:
+    kubernetes.io/hostname: aiops-k8s2   # ← 改成你集群中第二个 worker
+  template:
+    metadata: {}
+    spec:
+      containers:
+        - name: net
+          image: nicolaka/netshoot:latest
+          command: ["sleep", "infinity"]
+  links:
+    - uid: 100
+      peer_pod: r1
+      local_intf: r2_r1
+      peer_intf:  r1_r2
+      local_ip:   192.168.0.2/24
+      peer_ip:    192.168.0.1/24

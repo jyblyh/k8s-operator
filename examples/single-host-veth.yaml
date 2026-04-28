@@ -1,0 +1,64 @@
+# 示例：同节点两个 host 通过 veth 直连
+#
+# 验证目标：M1 单节点 veth 闭环
+#   kubectl apply -f examples/single-host-veth.yaml
+#   kubectl wait --for=condition=PodReady pod/host1 -n demo --timeout=60s
+#   kubectl exec -n demo host1 -- ping -c 3 10.0.0.2
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+
+---
+apiVersion: vntopo.bupt.site/v1alpha1
+kind: VNode
+metadata:
+  name: host1
+  namespace: demo
+spec:
+  role: host
+  dataCenter: dc1
+  nodeSelector:
+    kubernetes.io/hostname: aiops-k8s1   # ← 改成你集群中真实的 worker 节点
+  template:
+    metadata: {}
+    spec:
+      containers:
+        - name: net
+          image: nicolaka/netshoot:latest
+          command: ["sleep", "infinity"]
+  links:
+    - uid: 1
+      peer_pod: host2
+      local_intf: host1_host2
+      peer_intf:  host2_host1
+      local_ip:   10.0.0.1/24
+      peer_ip:    10.0.0.2/24
+
+---
+apiVersion: vntopo.bupt.site/v1alpha1
+kind: VNode
+metadata:
+  name: host2
+  namespace: demo
+spec:
+  role: host
+  dataCenter: dc1
+  nodeSelector:
+    kubernetes.io/hostname: aiops-k8s1
+  template:
+    metadata: {}
+    spec:
+      containers:
+        - name: net
+          image: nicolaka/netshoot:latest
+          command: ["sleep", "infinity"]
+  links:
+    - uid: 1
+      peer_pod: host1
+      local_intf: host2_host1
+      peer_intf:  host1_host2
+      local_ip:   10.0.0.2/24
+      peer_ip:    10.0.0.1/24

@@ -1,0 +1,26 @@
+# Dockerfile.agent：vntopo-agent (DaemonSet) 镜像
+#
+# 注意：agent 需要 netlink、nsenter、ip 等命令；不能用 distroless static。
+# 这里用 ubuntu 作为 base，体积大约 80MB；后续可换 alpine + 必要包。
+
+FROM golang:1.22 AS builder
+WORKDIR /workspace
+
+COPY go.mod go.sum* ./
+RUN go mod download || true
+
+COPY api/ api/
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY hack/ hack/
+
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+RUN go build -trimpath -ldflags "-s -w" -o /out/vntopo-agent ./cmd/agent
+
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 iputils-ping nftables conntrack ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/vntopo-agent /usr/local/bin/vntopo-agent
+ENTRYPOINT ["/usr/local/bin/vntopo-agent"]

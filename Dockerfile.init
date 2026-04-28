@@ -1,0 +1,23 @@
+# Dockerfile.init：vntopo-init initContainer 镜像
+#
+# 体积越小越好，因为每个 VNode Pod 都会拉一份。
+# 这里用 distroless static，仅放一个静态二进制。
+
+FROM golang:1.22 AS builder
+WORKDIR /workspace
+
+COPY go.mod go.sum* ./
+RUN go mod download || true
+
+COPY api/ api/
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY hack/ hack/
+
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+RUN go build -trimpath -ldflags "-s -w" -o /out/vntopo-init ./cmd/init
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=builder /out/vntopo-init /vntopo-init
+USER 65532:65532
+ENTRYPOINT ["/vntopo-init"]

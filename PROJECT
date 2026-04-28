@@ -1,0 +1,23 @@
+# 此文件由 kubebuilder 维护，描述项目元信息。
+# 当前为手写草稿，后续 `kubebuilder init` 会覆盖大部分字段。
+domain: bupt.site
+layout:
+- go.kubebuilder.io/v4
+projectName: vntopo-operator
+repo: github.com/bupt-aiops/vntopo-operator
+version: "3"
+multigroup: false
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: bupt.site
+  group: vntopo
+  kind: VNode
+  path: github.com/bupt-aiops/vntopo-operator/api/v1alpha1
+  version: v1alpha1
+  webhooks:
+    defaulting: true
+    validation: true
+    webhookVersion: v1

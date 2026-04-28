@@ -1,0 +1,112 @@
+# Image registry & tags
+REGISTRY        ?= docker.io/bupt-aiops
+TAG             ?= dev
+IMG_CONTROLLER  ?= $(REGISTRY)/vntopo-controller:$(TAG)
+IMG_AGENT       ?= $(REGISTRY)/vntopo-agent:$(TAG)
+IMG_INIT        ?= $(REGISTRY)/vntopo-init:$(TAG)
+
+# Tooling versions
+CONTROLLER_GEN_VERSION ?= v0.15.0
+KUSTOMIZE_VERSION      ?= v5.4.2
+
+# 本机 go bin 目录
+LOCALBIN        ?= $(shell pwd)/bin
+CONTROLLER_GEN  ?= $(LOCALBIN)/controller-gen
+KUSTOMIZE       ?= $(LOCALBIN)/kustomize
+
+##@ General
+
+.PHONY: help
+help:                   ## 显示帮助
+	@grep -E '^[a-zA-Z_-]+:.*?##' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*##"}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
+
+##@ Codegen
+
+.PHONY: tools
+tools: $(CONTROLLER_GEN) $(KUSTOMIZE)   ## 安装 controller-gen / kustomize 到 ./bin
+
+$(LOCALBIN):
+	mkdir -p $(LOCALBIN)
+
+$(CONTROLLER_GEN): $(LOCALBIN)
+	GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
+
+$(KUSTOMIZE): $(LOCALBIN)
+	GOBIN=$(LOCALBIN) go install sigs.k8s.io/kustomize/kustomize/v5@$(KUSTOMIZE_VERSION)
+
+.PHONY: generate
+generate: $(CONTROLLER_GEN)             ## 生成 deepcopy 函数
+	$(CONTROLLER_GEN) object:headerFile=hack/boilerplate.go.txt paths="./api/..."
+
+.PHONY: manifests
+manifests: $(CONTROLLER_GEN)            ## 生成 CRD / RBAC YAML
+	$(CONTROLLER_GEN) crd rbac:roleName=vntopo-controller-role webhook \
+	    paths="./..." \
+	    output:crd:artifacts:config=config/crd/bases \
+	    output:rbac:artifacts:config=config/rbac
+
+.PHONY: proto
+proto:                                  ## 生成 netservice gRPC 代码（需要 protoc + 插件）
+	protoc --go_out=. --go_opt=paths=source_relative \
+	       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+	       internal/netservice/netservice.proto
+
+##@ Build
+
+.PHONY: fmt vet tidy
+fmt:    ; go fmt ./...
+vet:    ; go vet ./...
+tidy:   ; go mod tidy
+
+.PHONY: test
+test: generate fmt vet                  ## 运行单元测试
+	go test ./... -coverprofile cover.out
+
+.PHONY: build-controller build-agent build-init
+build-controller:
+	go build -o bin/vntopo-controller ./cmd/controller
+build-agent:
+	go build -o bin/vntopo-agent ./cmd/agent
+build-init:
+	go build -o bin/vntopo-init ./cmd/init
+
+.PHONY: build
+build: build-controller build-agent build-init   ## 编译三个二进制
+
+##@ Docker
+
+.PHONY: docker-build docker-build-controller docker-build-agent docker-build-init
+docker-build-controller:
+	docker build -t $(IMG_CONTROLLER) -f Dockerfile .
+docker-build-agent:
+	docker build -t $(IMG_AGENT) -f Dockerfile.agent .
+docker-build-init:
+	docker build -t $(IMG_INIT) -f Dockerfile.init .
+
+docker-build: docker-build-controller docker-build-agent docker-build-init  ## 构建三个镜像
+
+.PHONY: docker-push
+docker-push:                            ## 推送镜像
+	docker push $(IMG_CONTROLLER)
+	docker push $(IMG_AGENT)
+	docker push $(IMG_INIT)
+
+##@ Deploy
+
+.PHONY: install
+install: manifests $(KUSTOMIZE)         ## 仅安装 CRD
+	$(KUSTOMIZE) build config/crd | kubectl apply -f -
+
+.PHONY: uninstall
+uninstall: $(KUSTOMIZE)                 ## 卸载 CRD
+	$(KUSTOMIZE) build config/crd | kubectl delete --ignore-not-found -f -
+
+.PHONY: deploy
+deploy: manifests $(KUSTOMIZE)          ## 部署 controller + agent + RBAC + namespace
+	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG_CONTROLLER)
+	cd config/agent   && $(KUSTOMIZE) edit set image agent=$(IMG_AGENT) init=$(IMG_INIT)
+	$(KUSTOMIZE) build config/default | kubectl apply -f -
+
+.PHONY: undeploy
+undeploy: $(KUSTOMIZE)                  ## 卸载所有资源
+	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found -f -

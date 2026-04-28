@@ -1,0 +1,175 @@
+---
+# 注意：此 YAML 为手写设计稿，作为 schema 评审用。
+# 后续 `make generate manifests` 会基于 api/v1alpha1/vnode_types.go 自动重新生成。
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: vnodes.vntopo.bupt.site
+spec:
+  group: vntopo.bupt.site
+  names:
+    kind: VNode
+    listKind: VNodeList
+    plural: vnodes
+    singular: vnode
+    shortNames:
+      - vn
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Role
+          type: string
+          jsonPath: .spec.role
+        - name: DC
+          type: string
+          jsonPath: .spec.dataCenter
+        - name: Node
+          type: string
+          jsonPath: .status.hostNode
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [role, template]
+              properties:
+                role:
+                  type: string
+                  enum: [host, sw, asw, csw, r, fw, dhcp, dns, ws]
+                dataCenter:
+                  type: string
+                  description: 所属数据中心标识；同 DC 内所有 VNode 必须共享同一份 nodeSelector
+                nodeSelector:
+                  type: object
+                  additionalProperties:
+                    type: string
+                affinity:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: corev1.Affinity，与 nodeSelector 二选一/可叠加
+                template:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: |
+                    corev1.PodTemplateSpec。controller 会注入：
+                      · ownerReferences -> VNode
+                      · nodeSelector / affinity（来自 spec.nodeSelector / spec.affinity）
+                      · labels: vntopo.bupt.site/{role,dc,vnode}
+                      · 一个 init container: vntopo-init
+                localIp:
+                  type: string
+                  description: 兼容字段
+                links:
+                  type: array
+                  items:
+                    type: object
+                    required: [uid, peer_pod, local_intf, peer_intf]
+                    properties:
+                      uid:
+                        type: integer
+                        format: int64
+                      peer_pod:
+                        type: string
+                      local_intf:
+                        type: string
+                        maxLength: 15
+                      peer_intf:
+                        type: string
+                        maxLength: 15
+                      local_ip:
+                        type: string
+                      peer_ip:
+                        type: string
+                      cost:
+                        type: number
+                      metrics:
+                        type: object
+                        properties:
+                          bandwidth_mbps: { type: number }
+                          jitter_ms:      { type: number }
+                          latency_ms:     { type: number }
+                          loss_percentage:{ type: number }
+                          last_updated:
+                            type: string
+                            format: date-time
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Creating, Ready, Degraded, Deleting, Failed]
+                observedGeneration:
+                  type: integer
+                  format: int64
+                hostIP:
+                  type: string
+                hostNode:
+                  type: string
+                netNs:
+                  type: string
+                containerID:
+                  type: string
+                srcIP:
+                  type: string
+                skipped:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      link_id:
+                        type: integer
+                        format: int64
+                      pod_name:
+                        type: string
+                linkStatus:
+                  type: array
+                  items:
+                    type: object
+                    required: [uid]
+                    properties:
+                      uid:
+                        type: integer
+                        format: int64
+                      peer_pod:
+                        type: string
+                      state:
+                        type: string
+                        enum: [Pending, Established, Error]
+                      mode:
+                        type: string
+                        enum: [veth, vxlan]
+                      vni:
+                        type: integer
+                        format: int64
+                      underlayIP:
+                        type: string
+                      lastError:
+                        type: string
+                      establishedAt:
+                        type: string
+                        format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status, lastTransitionTime, reason, message]
+                    properties:
+                      type:               { type: string }
+                      status:             { type: string, enum: ["True", "False", "Unknown"] }
+                      observedGeneration: { type: integer, format: int64 }
+                      lastTransitionTime: { type: string, format: date-time }
+                      reason:             { type: string }
+                      message:            { type: string }

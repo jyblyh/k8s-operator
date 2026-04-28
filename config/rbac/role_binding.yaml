@@ -1,0 +1,26 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vntopo-controller-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vntopo-controller-role
+subjects:
+- kind: ServiceAccount
+  name: vntopo-controller
+  namespace: vntopo-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vntopo-agent-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vntopo-agent-role
+subjects:
+- kind: ServiceAccount
+  name: vntopo-agent
+  namespace: vntopo-system

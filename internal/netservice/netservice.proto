@@ -1,0 +1,41 @@
+// Copyright 2026 BUPT AIOps Lab.
+//
+// vntopo-init <-> vntopo-agent 之间的本地协议。
+// 兼容 p2pnet 的 Local service，以便 fork 时改动最小。
+syntax = "proto3";
+
+package vntopo.netservice;
+
+option go_package = "github.com/bupt-aiops/vntopo-operator/internal/netservice;netservicepb";
+
+// Local 由 vntopo-agent 在 unix socket 上暴露，由 vntopo-init 调用。
+service Local {
+  // SetupLinks 通知 agent："我（pod）的 netns 已就绪，请按当前 VNode CR 给我建好所有链路"。
+  // agent 完成或失败后才会返回，初始容器据此决定退出码。
+  rpc SetupLinks(SetupReq) returns (SetupResp);
+
+  // TeardownLinks 显式拆除链路（一般由 K8s pod-delete 事件触发，不必手动调用，
+  // 这里保留接口便于运维 / 兼容 p2pnet 老协议）。
+  rpc TeardownLinks(TeardownReq) returns (TeardownResp);
+}
+
+message SetupReq {
+  string namespace = 1;
+  string pod_name  = 2;
+  string host_ip   = 3;
+}
+
+message SetupResp {
+  bool   ok     = 1;
+  string detail = 2;
+}
+
+message TeardownReq {
+  string namespace = 1;
+  string pod_name  = 2;
+}
+
+message TeardownResp {
+  bool   ok     = 1;
+  string detail = 2;
+}
