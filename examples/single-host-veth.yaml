@@ -33,8 +33,13 @@ spec:
     metadata: {}
     spec:
       containers:
-        - name: net
-          image: nicolaka/netshoot:latest
+        - name: pod
+          # 已搬运到你的 ACR；如果还没搬，先在能访问 dockerhub 的机器上：
+          #   docker pull nicolaka/netshoot:latest
+          #   docker tag  nicolaka/netshoot:latest \
+          #     crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/netshoot:latest
+          #   docker push crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/netshoot:latest
+          image: crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/yyc:host-debian
           command: ["sleep", "infinity"]
   links:
     - uid: 1
@@ -59,8 +64,8 @@ spec:
     metadata: {}
     spec:
       containers:
-        - name: net
-          image: nicolaka/netshoot:latest
+        - name: pod
+          image: crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/yyc:host-debian
           command: ["sleep", "infinity"]
   links:
     - uid: 1
