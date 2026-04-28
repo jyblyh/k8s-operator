@@ -1,9 +1,9 @@
 ---
-# 注意：此 YAML 为手写设计稿，作为 schema 评审用。
-# 后续 `make generate manifests` 会基于 api/v1alpha1/vnode_types.go 自动重新生成。
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.15.0
   name: vnodes.vntopo.bupt.site
 spec:
   group: vntopo.bupt.site
@@ -11,165 +11,314 @@ spec:
     kind: VNode
     listKind: VNodeList
     plural: vnodes
-    singular: vnode
     shortNames:
-      - vn
+    - vn
+    singular: vnode
   scope: Namespaced
   versions:
-    - name: v1alpha1
-      served: true
-      storage: true
-      subresources:
-        status: {}
-      additionalPrinterColumns:
-        - name: Role
-          type: string
-          jsonPath: .spec.role
-        - name: DC
-          type: string
-          jsonPath: .spec.dataCenter
-        - name: Node
-          type: string
-          jsonPath: .status.hostNode
-        - name: Phase
-          type: string
-          jsonPath: .status.phase
-        - name: Age
-          type: date
-          jsonPath: .metadata.creationTimestamp
-      schema:
-        openAPIV3Schema:
-          type: object
-          required: [spec]
-          properties:
-            spec:
-              type: object
-              required: [role, template]
-              properties:
-                role:
-                  type: string
-                  enum: [host, sw, asw, csw, r, fw, dhcp, dns, ws]
-                dataCenter:
-                  type: string
-                  description: 所属数据中心标识；同 DC 内所有 VNode 必须共享同一份 nodeSelector
-                nodeSelector:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.role
+      name: Role
+      type: string
+    - jsonPath: .spec.dataCenter
+      name: DC
+      type: string
+    - jsonPath: .status.hostNode
+      name: Node
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: VNode 描述一个虚拟网络节点（virtual node）及其所有出边链路。
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: VNodeSpec 是 VNode 的期望状态。
+            properties:
+              affinity:
+                description: |-
+                  高级亲和性配置；可与 nodeSelector 叠加，也可单独使用。
+
+
+                  故意用 Schemaless + PreserveUnknownFields：
+                    - 让 controller-gen 不要把 corev1.Affinity 展开成几百行的 OpenAPI schema，
+                      避免 K8s 1.21 的 CRD 校验器解析超大嵌套 schema 时报 unmarshal 错误。
+                    - 这只影响 CRD schema 校验；Go 侧的反序列化仍然按 corev1.Affinity 严格走。
+                x-kubernetes-preserve-unknown-fields: true
+              dataCenter:
+                description: |-
+                  所属数据中心标识。同一 dataCenter 下的所有 VNode 必须共享同一个 nodeSelector
+                  （由 webhook 强制校验）。role=r 作为 inter-DC 路由器时可留空。
+                type: string
+              links:
+                description: 本 VNode 对外的所有点对点链路。
+                items:
+                  description: LinkSpec 描述本 VNode 对外的一条点对点链路。两端必须使用相同的 uid。
+                  properties:
+                    cost:
+                      description: 路由权重 / 链路代价。
+                      type: number
+                    local_intf:
+                      description: 本端在 pod netns 内的接口名，遵循 Linux 接口命名规则，最大 15 字符。
+                      maxLength: 15
+                      type: string
+                    local_ip:
+                      description: 本端接口 IP（建议 CIDR 格式，例如 "10.0.0.1/24"）。
+                      type: string
+                    metrics:
+                      description: LinkMetrics 描述链路的运行时指标，可由外部探测器（如 ping_exporter）回填。
+                      properties:
+                        bandwidth_mbps:
+                          type: number
+                        jitter_ms:
+                          type: number
+                        last_updated:
+                          format: date-time
+                          type: string
+                        latency_ms:
+                          type: number
+                        loss_percentage:
+                          type: number
+                      type: object
+                    peer_intf:
+                      description: 对端在 pod netns 内的接口名，遵循 Linux 接口命名规则，最大 15 字符。
+                      maxLength: 15
+                      type: string
+                    peer_ip:
+                      description: 对端接口 IP（信息字段，agent 不会写到对端）。
+                      type: string
+                    peer_pod:
+                      description: 对端 VNode 的 name（同 namespace）。
+                      type: string
+                    uid:
+                      description: 链路在所属 namespace 内的唯一 ID，两端必须用同一个值。
+                      format: int64
+                      minimum: 1
+                      type: integer
+                  required:
+                  - local_intf
+                  - peer_intf
+                  - peer_pod
+                  - uid
                   type: object
-                  additionalProperties:
-                    type: string
-                affinity:
+                type: array
+              localIp:
+                description: 兼容字段，部分组件读取 pod 主 IP 用。
+                type: string
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: 显式 nodeSelector。同 DC 的非路由器节点必填，且与同 DC 其它 VNode 一致。
+                type: object
+              role:
+                description: 节点角色。
+                enum:
+                - host
+                - sw
+                - asw
+                - csw
+                - r
+                - fw
+                - dhcp
+                - dns
+                - ws
+                type: string
+              template:
+                description: |-
+                  Pod 模板。controller 会在创建 Pod 时注入：
+                    · ownerReferences -> VNode
+                    · nodeSelector / affinity（来自 spec.nodeSelector / spec.affinity）
+                    · labels: vntopo.bupt.site/{role,dc,vnode}
+                    · 一个 init container：vntopo-init
+
+
+                  Schemaless 同上，避免展开 PodTemplateSpec 这棵超大 schema 树。
+                x-kubernetes-preserve-unknown-fields: true
+            required:
+            - role
+            - template
+            type: object
+          status:
+            description: VNodeStatus 是 VNode 的实际运行状态。
+            properties:
+              conditions:
+                description: 标准 K8s conditions：LinksConverged / PodReady / Validated
+                  等。
+                items:
+                  description: |-
+                    Condition contains details for one aspect of the current state of this API Resource.
+                    ---
+                    This struct is intended for direct use as an array at the field path .status.conditions.  For example,
+                    type FooStatus struct{
+                        // Represents the observations of a foo's current state.
+                        // Known .status.conditions.type are: "Available", "Progressing", and "Degraded"
+                        // +patchMergeKey=type
+                        // +patchStrategy=merge
+                        // +listType=map
+                        // +listMapKey=type
+                        Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
+
+
+                        // other fields
+                    }
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: |-
+                        type of condition in CamelCase or in foo.example.com/CamelCase.
+                        ---
+                        Many .condition.type values are consistent across resources like Available, but because arbitrary conditions can be
+                        useful (see .node.status.conditions), the ability to deconflict is important.
+                        The regex it matches is (dns1123SubdomainFmt/)?(qualifiedNameFmt)
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
                   type: object
-                  x-kubernetes-preserve-unknown-fields: true
-                  description: corev1.Affinity，与 nodeSelector 二选一/可叠加
-                template:
+                type: array
+              containerID:
+                description: sandbox 容器 ID，pod 重建后会变化，agent 据此判断是否要重建链路。
+                type: string
+              hostIP:
+                type: string
+              hostNode:
+                type: string
+              linkStatus:
+                items:
+                  description: LinkStatus 描述一条链路（按 uid 索引）的实际建立情况。
+                  properties:
+                    establishedAt:
+                      format: date-time
+                      type: string
+                    lastError:
+                      type: string
+                    mode:
+                      description: LinkMode 表示某条链路的实现模式。
+                      enum:
+                      - veth
+                      - vxlan
+                      type: string
+                    peer_pod:
+                      type: string
+                    state:
+                      description: LinkState 表示某条链路的当前建立状态。
+                      enum:
+                      - Pending
+                      - Established
+                      - Error
+                      type: string
+                    uid:
+                      format: int64
+                      type: integer
+                    underlayIP:
+                      description: 跨节点链路对端节点的 InternalIP。
+                      type: string
+                    vni:
+                      description: VXLAN 模式下使用，由 controller 集中分配。
+                      format: int32
+                      type: integer
+                  required:
+                  - uid
                   type: object
-                  x-kubernetes-preserve-unknown-fields: true
-                  description: |
-                    corev1.PodTemplateSpec。controller 会注入：
-                      · ownerReferences -> VNode
-                      · nodeSelector / affinity（来自 spec.nodeSelector / spec.affinity）
-                      · labels: vntopo.bupt.site/{role,dc,vnode}
-                      · 一个 init container: vntopo-init
-                localIp:
-                  type: string
-                  description: 兼容字段
-                links:
-                  type: array
-                  items:
-                    type: object
-                    required: [uid, peer_pod, local_intf, peer_intf]
-                    properties:
-                      uid:
-                        type: integer
-                        format: int64
-                      peer_pod:
-                        type: string
-                      local_intf:
-                        type: string
-                        maxLength: 15
-                      peer_intf:
-                        type: string
-                        maxLength: 15
-                      local_ip:
-                        type: string
-                      peer_ip:
-                        type: string
-                      cost:
-                        type: number
-                      metrics:
-                        type: object
-                        properties:
-                          bandwidth_mbps: { type: number }
-                          jitter_ms:      { type: number }
-                          latency_ms:     { type: number }
-                          loss_percentage:{ type: number }
-                          last_updated:
-                            type: string
-                            format: date-time
-            status:
-              type: object
-              properties:
-                phase:
-                  type: string
-                  enum: [Pending, Creating, Ready, Degraded, Deleting, Failed]
-                observedGeneration:
-                  type: integer
-                  format: int64
-                hostIP:
-                  type: string
-                hostNode:
-                  type: string
-                netNs:
-                  type: string
-                containerID:
-                  type: string
-                srcIP:
-                  type: string
-                skipped:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      link_id:
-                        type: integer
-                        format: int64
-                      pod_name:
-                        type: string
-                linkStatus:
-                  type: array
-                  items:
-                    type: object
-                    required: [uid]
-                    properties:
-                      uid:
-                        type: integer
-                        format: int64
-                      peer_pod:
-                        type: string
-                      state:
-                        type: string
-                        enum: [Pending, Established, Error]
-                      mode:
-                        type: string
-                        enum: [veth, vxlan]
-                      vni:
-                        type: integer
-                        format: int64
-                      underlayIP:
-                        type: string
-                      lastError:
-                        type: string
-                      establishedAt:
-                        type: string
-                        format: date-time
-                conditions:
-                  type: array
-                  items:
-                    type: object
-                    required: [type, status, lastTransitionTime, reason, message]
-                    properties:
-                      type:               { type: string }
-                      status:             { type: string, enum: ["True", "False", "Unknown"] }
-                      observedGeneration: { type: integer, format: int64 }
-                      lastTransitionTime: { type: string, format: date-time }
-                      reason:             { type: string }
-                      message:            { type: string }
+                type: array
+              netNs:
+                description: Pod 的 netns 路径（沿用 meshnet 字段名）。
+                type: string
+              observedGeneration:
+                description: 对应已被 controller 处理过的最新 spec 版本。
+                format: int64
+                type: integer
+              phase:
+                description: VNodePhase 表示 VNode 整体生命周期阶段。
+                enum:
+                - Pending
+                - Creating
+                - Ready
+                - Degraded
+                - Deleting
+                - Failed
+                type: string
+              skipped:
+                items:
+                  description: SkippedItem 沿用 meshnet 字段语义，记录因对端未就绪暂时跳过的链路。
+                  properties:
+                    link_id:
+                      format: int64
+                      type: integer
+                    pod_name:
+                      type: string
+                  type: object
+                type: array
+              srcIP:
+                description: Pod 主 IP（沿用）。
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
