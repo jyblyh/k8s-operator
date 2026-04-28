@@ -96,8 +96,12 @@ docker-push:                            ## 推送镜像
 
 ##@ Deploy
 
+# install / deploy / undeploy 不依赖 manifests / controller-gen，
+# 因为 CRD YAML 已 commit 进 git。这样这些 target 可以在 master 节点（没装 Go）上直接跑。
+# 改了 api/ 下 Go 类型时，请先在虚拟机上 `make manifests` 然后 commit + push。
+
 .PHONY: install
-install: manifests $(KUSTOMIZE)         ## 仅安装 CRD
+install: $(KUSTOMIZE)                   ## 仅安装 CRD
 	$(KUSTOMIZE) build config/crd | kubectl apply -f -
 
 .PHONY: uninstall
@@ -105,7 +109,7 @@ uninstall: $(KUSTOMIZE)                 ## 卸载 CRD
 	$(KUSTOMIZE) build config/crd | kubectl delete --ignore-not-found -f -
 
 .PHONY: deploy
-deploy: manifests $(KUSTOMIZE)          ## 部署 controller + agent + RBAC + namespace
+deploy: $(KUSTOMIZE)                    ## 部署 controller + agent + RBAC + namespace
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG_CONTROLLER)
 	cd config/agent   && $(KUSTOMIZE) edit set image agent=$(IMG_AGENT) init=$(IMG_INIT)
 	# 把 deployment.yaml 里 VNTOPO_INIT_IMAGE env 占位符替换为最终 init 镜像。
