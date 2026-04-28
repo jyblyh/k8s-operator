@@ -4,69 +4,40 @@ Copyright 2026 BUPT AIOps Lab.
 
 // vntopo-init：作为 initContainer 注入到每个 VNode Pod。
 //
-// 行为：
-//  1. 从环境变量读取 POD_NAME / POD_NAMESPACE / HOST_IP（由 controller 注入）。
-//  2. 通过本节点 unix socket（默认 /var/run/vntopo/agent.sock，由 hostPath 挂载）
-//     拨号到 vntopo-agent 并调用 SetupLinks。
-//  3. 阻塞等待 agent 完成；成功 exit 0，失败 exit 1（让 Pod 进入 CrashLoopBackOff，
-//     业务容器不会被启动）。
+// 阶段说明
+// =========
+//
+// **M1（当前）**：完全 no-op。只打印 Downward API 注入的环境变量，立即 exit 0，
+// 让业务容器能起来。我们这一阶段验证的是 controller 的 ensurePod + syncStatus，
+// 跟 agent 没关系；如果在这里去拨 agent socket，反而会被
+// "agent 那边 gRPC server 暂时还没注册任何 Service" 这种非业务问题卡住。
+//
+// **M2**：恢复真正的 gRPC 调用：
+//
+//	conn, err := grpc.DialContext(ctx, "unix://"+socketPath, ...)
+//	cli       := netservicepb.NewLocalClient(conn)
+//	resp, err := cli.SetupLinks(ctx, &netservicepb.SetupReq{ ... })
+//
+// 此时 agent 已经注册了 LocalServer，初始化失败就让 Pod CrashLoopBackOff，
+// 是合理的——业务容器拿不到对端，本来也不该起。
 package main
 
 import (
-	"context"
-	"flag"
 	"fmt"
-	"net"
 	"os"
-	"strings"
-	"time"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
-	"github.com/jyblyh/k8s-operator/internal/common"
-	"github.com/jyblyh/k8s-operator/internal/initclient"
 )
 
 func main() {
-	socketPath := flag.String("socket-path", common.AgentSocketPath, "agent unix socket")
-	timeoutSec := flag.Int("timeout", 60, "max seconds to wait for agent SetupLinks")
-	flag.Parse()
-
 	podName := os.Getenv("POD_NAME")
 	podNs := os.Getenv("POD_NAMESPACE")
 	hostIP := os.Getenv("HOST_IP")
 	if podName == "" || podNs == "" {
-		fail("POD_NAME / POD_NAMESPACE env not set")
+		fmt.Fprintln(os.Stderr, "[vntopo-init] FATAL POD_NAME / POD_NAMESPACE env not set")
+		os.Exit(1)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutSec)*time.Second)
-	defer cancel()
-
-	conn, err := grpc.DialContext(
-		ctx,
-		"unix://"+*socketPath,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-			d := net.Dialer{}
-			path := strings.TrimPrefix(addr, "unix://")
-			return d.DialContext(ctx, "unix", path)
-		}),
-	)
-	if err != nil {
-		fail("dial agent failed: %v", err)
-	}
-	defer conn.Close()
-
-	if err := initclient.SetupLinks(ctx, conn, podNs, podName, hostIP); err != nil {
-		fail("SetupLinks failed: %v", err)
-	}
-
+	fmt.Fprintf(os.Stderr,
+		"[vntopo-init] M1 no-op: pod=%s/%s host=%s — link setup will be done in M2\n",
+		podNs, podName, hostIP)
 	os.Exit(0)
-}
-
-func fail(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "[vntopo-init] FATAL "+format+"\n", args...)
-	os.Exit(1)
 }
