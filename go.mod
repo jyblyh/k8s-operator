@@ -14,7 +14,8 @@ go 1.18
 // =====================================================================
 require (
 	github.com/go-logr/logr v1.2.0
-	github.com/redhat-nfvpe/koko v0.0.0-20210414175119-3722cba9c4e8
+	github.com/karkar0813/koko v0.0.0-20250427095552-153706c672a4 // indirect
+	github.com/redhat-nfvpe/koko v0.0.0-20241203052104-ec78eb8730bf // indirect
 	github.com/spf13/pflag v1.0.5
 	github.com/vishvananda/netlink v1.1.1-0.20210330154013-f5de75959ad5
 	github.com/vishvananda/netns v0.0.0-20210104183010-2eb08e3e575f
