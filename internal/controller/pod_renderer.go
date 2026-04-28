@@ -9,8 +9,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	vntopov1alpha1 "github.com/bupt-aiops/vntopo-operator/api/v1alpha1"
-	"github.com/bupt-aiops/vntopo-operator/internal/common"
+	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
+	"github.com/jyblyh/k8s-operator/internal/common"
 )
 
 // renderPod 把 VNode.spec.template 渲染成最终下发到集群的 Pod。

@@ -6,6 +6,6 @@ metadata:
   labels:
     app.kubernetes.io/name: vntopo-operator
     app.kubernetes.io/component: namespace
-    pod-security.kubernetes.io/enforce: privileged
-    pod-security.kubernetes.io/audit: privileged
-    pod-security.kubernetes.io/warn: privileged
+# 注：Pod Security Admission (pod-security.kubernetes.io/*) 是 K8s 1.23+ 引入的，
+# 1.21 集群不认这些 label，本来 1.23+ 也是配合 PSP 退役用的；这里去掉避免误导。
+# agent DaemonSet 仍然以 privileged 运行，依赖 RBAC 控权。

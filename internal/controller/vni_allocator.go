@@ -7,8 +7,8 @@ package controller
 import (
 	"context"
 
-	vntopov1alpha1 "github.com/bupt-aiops/vntopo-operator/api/v1alpha1"
-	"github.com/bupt-aiops/vntopo-operator/internal/common"
+	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
+	"github.com/jyblyh/k8s-operator/internal/common"
 )
 
 // AllocateVNI 给 (namespace, uid) 分配一个 24-bit VNI，保证同 namespace 内不冲突。

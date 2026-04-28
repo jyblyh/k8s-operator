@@ -4,7 +4,7 @@ domain: bupt.site
 layout:
 - go.kubebuilder.io/v4
 projectName: vntopo-operator
-repo: github.com/bupt-aiops/vntopo-operator
+repo: github.com/jyblyh/k8s-operator
 version: "3"
 multigroup: false
 resources:
@@ -15,7 +15,7 @@ resources:
   domain: bupt.site
   group: vntopo
   kind: VNode
-  path: github.com/bupt-aiops/vntopo-operator/api/v1alpha1
+  path: github.com/jyblyh/k8s-operator/api/v1alpha1
   version: v1alpha1
   webhooks:
     defaulting: true

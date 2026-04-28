@@ -6,7 +6,7 @@ Copyright 2026 BUPT AIOps Lab.
 //
 // 等 protoc 生成 internal/netservice/*.pb.go 后，本文件会改成：
 //
-//	import netservicepb "github.com/bupt-aiops/vntopo-operator/internal/netservice"
+//	import netservicepb "github.com/jyblyh/k8s-operator/internal/netservice"
 //	cli := netservicepb.NewLocalClient(conn)
 //	resp, err := cli.SetupLinks(ctx, &netservicepb.SetupReq{...})
 //

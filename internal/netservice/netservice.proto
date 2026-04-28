@@ -6,7 +6,7 @@ syntax = "proto3";
 
 package vntopo.netservice;
 
-option go_package = "github.com/bupt-aiops/vntopo-operator/internal/netservice;netservicepb";
+option go_package = "github.com/jyblyh/k8s-operator/internal/netservice;netservicepb";
 
 // Local 由 vntopo-agent 在 unix socket 上暴露，由 vntopo-init 调用。
 service Local {

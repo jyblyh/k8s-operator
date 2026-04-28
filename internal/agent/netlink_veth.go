@@ -7,7 +7,7 @@ package agent
 import (
 	"context"
 
-	vntopov1alpha1 "github.com/bupt-aiops/vntopo-operator/api/v1alpha1"
+	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
 )
 
 // MakeVeth 在两个同节点 Pod 的 netns 之间建立一对 veth。

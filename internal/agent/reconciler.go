@@ -23,8 +23,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	vntopov1alpha1 "github.com/bupt-aiops/vntopo-operator/api/v1alpha1"
+	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
 )
 
 // Reconciler 在每个 worker 节点上跑，处理本节点 Pod 的链路 diff & apply。
@@ -67,13 +68,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 // SetupWithManager 注册 watch；通过 fieldSelector 限定只接收本节点 Pod 对应的 VNode。
 //
-// 注意：fieldSelector 需要在 cache 配置里给 Pod 注册 indexer 才能用 spec.nodeName 过滤；
-// 这里用 Watch + Predicate 的方式，简单地只对"hostNode 等于 r.NodeName"的 VNode 响应。
+// 注意：controller-runtime v0.11.x 的 Watches 需要 source.Kind 包装；
+// MapFunc 不接收 ctx（v0.15+ 才加上）。
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vntopov1alpha1.VNode{}, builder.WithPredicates()).
 		Watches(
-			&corev1.Pod{},
+			&source.Kind{Type: &corev1.Pod{}},
 			handler.EnqueueRequestsFromMapFunc(r.mapPodToVNode),
 			builder.WithPredicates(podOnThisNode(r.NodeName)),
 		).
@@ -81,7 +82,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // mapPodToVNode：Pod 事件 -> 对应 VNode 的 reconcile request（同名同 namespace）。
-func (r *Reconciler) mapPodToVNode(ctx context.Context, obj client.Object) []reconcile.Request {
+func (r *Reconciler) mapPodToVNode(obj client.Object) []reconcile.Request {
 	return []reconcile.Request{
 		{
 			NamespacedName: client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()},

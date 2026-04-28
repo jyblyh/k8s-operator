@@ -24,8 +24,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/bupt-aiops/vntopo-operator/internal/common"
-	"github.com/bupt-aiops/vntopo-operator/internal/initclient"
+	"github.com/jyblyh/k8s-operator/internal/common"
+	"github.com/jyblyh/k8s-operator/internal/initclient"
 )
 
 func main() {

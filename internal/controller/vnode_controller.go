@@ -32,9 +32,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	vntopov1alpha1 "github.com/bupt-aiops/vntopo-operator/api/v1alpha1"
-	"github.com/bupt-aiops/vntopo-operator/internal/common"
+	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
+	"github.com/jyblyh/k8s-operator/internal/common"
 )
 
 // VNodeReconciler reconciles a VNode object.
@@ -174,12 +175,15 @@ func (r *VNodeReconciler) recordValidationSuccess(vn *vntopov1alpha1.VNode) {
 //   - VNode 自身（主对象）
 //   - 由 VNode 拥有的 Pod（owns 关系，Pod 事件触发对应 VNode reconcile）
 //   - 邻居 VNode 的变更也要通过 EnqueueRequestsFromMapFunc 反向触发（M3 实现）。
+//
+// 注：controller-runtime v0.11.x 的 Watches 需要 source.Kind 包装；
+// MapFunc 不接收 ctx（v0.15+ 才加上）。
 func (r *VNodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vntopov1alpha1.VNode{}, builder.WithPredicates()).
 		Owns(&corev1.Pod{}).
 		Watches(
-			&vntopov1alpha1.VNode{},
+			&source.Kind{Type: &vntopov1alpha1.VNode{}},
 			handler.EnqueueRequestsFromMapFunc(r.mapPeerToReconcile),
 		).
 		Complete(r)
@@ -187,6 +191,6 @@ func (r *VNodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // mapPeerToReconcile 当某个 VNode 的 status.hostIP 变化时，触发它所有 peer 的 reconcile。
 // M3 中实装；M1 暂返回空切片。
-func (r *VNodeReconciler) mapPeerToReconcile(ctx context.Context, obj client.Object) []reconcile.Request {
+func (r *VNodeReconciler) mapPeerToReconcile(obj client.Object) []reconcile.Request {
 	return nil
 }

@@ -22,9 +22,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	vntopov1alpha1 "github.com/bupt-aiops/vntopo-operator/api/v1alpha1"
-	"github.com/bupt-aiops/vntopo-operator/internal/agent"
-	"github.com/bupt-aiops/vntopo-operator/internal/common"
+	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
+	"github.com/jyblyh/k8s-operator/internal/agent"
+	"github.com/jyblyh/k8s-operator/internal/common"
 )
 
 var (

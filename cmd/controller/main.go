@@ -14,10 +14,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	vntopov1alpha1 "github.com/bupt-aiops/vntopo-operator/api/v1alpha1"
-	vncontroller "github.com/bupt-aiops/vntopo-operator/internal/controller"
+	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
+	vncontroller "github.com/jyblyh/k8s-operator/internal/controller"
 )
 
 var (
@@ -50,9 +49,11 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	// 注意：controller-runtime v0.11.x 的 Options 直接是 string 字段；
+	// v0.16+ 才改成 metricsserver.Options{BindAddress: ...} 形式。
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		MetricsBindAddress:     metricsAddr,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "vntopo-controller.vntopo.bupt.site",

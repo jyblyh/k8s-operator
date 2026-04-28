@@ -7,7 +7,7 @@ package agent
 import (
 	"context"
 
-	vntopov1alpha1 "github.com/bupt-aiops/vntopo-operator/api/v1alpha1"
+	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
 )
 
 // MakeVXLAN 在 host 上建立"pod 端 veth + host 端 veth + vxlan + bridge"，
