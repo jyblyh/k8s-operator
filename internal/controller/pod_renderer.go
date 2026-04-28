@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
 	"github.com/jyblyh/k8s-operator/internal/common"
@@ -73,20 +74,11 @@ func renderPod(vn *vntopov1alpha1.VNode, initImage string, scheme *runtime.Schem
 		},
 	})
 
-	// ownerRef
-	gvk, err := scheme.ObjectKinds(vn)
-	if err != nil || len(gvk) == 0 {
+	// ownerRef：用 controller-runtime 官方工具，自动填 APIVersion/Kind/UID，
+	// 并设置 Controller=true、BlockOwnerDeletion=true，同时校验 ns 一致。
+	if err := controllerutil.SetControllerReference(vn, pod, scheme); err != nil {
 		return nil, err
 	}
-	t := true
-	pod.OwnerReferences = append(pod.OwnerReferences, metav1.OwnerReference{
-		APIVersion:         gvk[0].GroupVersion().String(),
-		Kind:               gvk[0].Kind,
-		Name:               vn.Name,
-		UID:                vn.UID,
-		Controller:         &t,
-		BlockOwnerDeletion: &t,
-	})
 
 	return pod, nil
 }
