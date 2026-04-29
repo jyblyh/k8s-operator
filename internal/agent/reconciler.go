@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
@@ -101,13 +102,24 @@ func (r *Reconciler) belongsToThisNode(vn *vntopov1alpha1.VNode) bool {
 	return false
 }
 
-// SetupWithManager 注册 watch；通过 predicate 限定只接收本节点 Pod 对应的 VNode。
+// SetupWithManager 注册 watch。
+//
+// 关键：VNode watch 只在 **spec generation 变化** 时触发；status 变化不触发。
+// 这一条非常重要——agent 自己 patch status.linkStatus 也会引起 watch 事件，
+// 如果不过滤就会形成 patch → reconcile → enqueue → patch 的反馈环，导致
+// worker 队列被相同任务灌爆（出现过 cap=256 全部装满的 bug）。
+//
+// 真正建链需要重新触发的事件：
+//   - VNode spec 改动（Generation 变化）→ 由 GenerationChangedPredicate 放行
+//   - Pod 创建/重建（containerID 变化）→ 由 Pod watch + podOnThisNode 放行
 //
 // 注意：controller-runtime v0.11.x 的 Watches 需要 source.Kind 包装；
 // MapFunc 不接收 ctx（v0.15+ 才加上）。
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&vntopov1alpha1.VNode{}, builder.WithPredicates()).
+		For(&vntopov1alpha1.VNode{},
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).
 		Watches(
 			&source.Kind{Type: &corev1.Pod{}},
 			handler.EnqueueRequestsFromMapFunc(r.mapPodToVNode),

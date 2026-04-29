@@ -48,6 +48,15 @@ type WorkerPool struct {
 	maxRetry  int           // 单任务最多重试几次
 	retryWait time.Duration // 重试间隔（指数退避基线）
 
+	// pending 跟踪当前**还在 channel 等待 worker 接走**的任务 key（"ns/name"）。
+	// reconciler / RPC 在短时间内对同一 Pod 多次 enqueue 时，重复请求会被合并成
+	// 一次任务——避免 status patch 引发 reconcile → re-enqueue → status patch
+	// 的反馈环把队列爆掉。
+	//
+	// 一旦 worker 把任务从 channel 取走，就从 pending 删掉；后续如果有新事件
+	// 来（比如对端 Pod 重建），还会被正常 enqueue 一次，确保不丢失变更。
+	pending sync.Map
+
 	wg     sync.WaitGroup
 	stopCh chan struct{}
 	closed bool
@@ -79,10 +88,12 @@ func (p *WorkerPool) Start(ctx context.Context, size int) {
 	}
 }
 
-// Enqueue 把任务塞进 queue。queue 满时立即返回错误（让 RPC 把 error 报给 init）。
+// Enqueue 把任务塞进 queue。
 //
-// 这里**不阻塞**——RPC 调用要快进快出。如果 queue 真的满了，说明 agent 严重过载，
-// 让 init 容器 CrashLoopBackOff 比假成功更安全。
+//   - **dedup**：同一个 (ns, name) 已经在队列里等待时直接 noop（视作成功），
+//     避免 reconciler / RPC 高频触发把队列灌爆。
+//   - **不阻塞**：channel 满时立即返回错误，让上游决定怎么处理（RPC 报错给
+//     init，reconciler 下次 reconcile 再试）。
 func (p *WorkerPool) Enqueue(task SetupTask) error {
 	p.mu.Lock()
 	closed := p.closed
@@ -94,10 +105,19 @@ func (p *WorkerPool) Enqueue(task SetupTask) error {
 	if task.EnqueuedAt.IsZero() {
 		task.EnqueuedAt = time.Now()
 	}
+
+	key := task.Namespace + "/" + task.PodName
+	// 同 key 已经在队列里等待 → 直接合并成功
+	if _, loaded := p.pending.LoadOrStore(key, struct{}{}); loaded {
+		return nil
+	}
+
 	select {
 	case p.tasks <- task:
 		return nil
 	default:
+		// 没塞进去，回滚 pending 标记，让下次 enqueue 还能尝试
+		p.pending.Delete(key)
 		return fmt.Errorf("worker queue full (cap=%d)", cap(p.tasks))
 	}
 }
@@ -131,6 +151,10 @@ func (p *WorkerPool) run(ctx context.Context, id int) {
 			if !ok {
 				return
 			}
+			// 任务被 worker 接走了：从 pending 删掉，让后续新事件还能正常入队。
+			// 注意要在 process 前删——process 里 patch status 又会触发 reconcile
+			// 重新 enqueue，那次合理的 enqueue 不应该被这次的 pending 标记挡住。
+			p.pending.Delete(task.Namespace + "/" + task.PodName)
 			p.process(ctx, logger, task)
 		}
 	}
