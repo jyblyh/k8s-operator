@@ -122,7 +122,11 @@ func main() {
 		setupLog.Error(err, "listen unix socket failed", "path", socketPath)
 		os.Exit(1)
 	}
-	if err := os.Chmod(socketPath, 0o660); err != nil {
+	// socket 权限 0666：init 容器（distroless/static:nonroot, UID=65532）也得能连。
+	// 这个 socket 在 hostPath /var/run/vntopo 下，只有挂载了同一 hostPath 的容器
+	// 才能 reach（DaemonSet 自身 + 我们注入的 init 容器），不存在外部用户连进来
+	// 的风险。生产可以改成 0660 + 给 init 容器 spec 加 supplementalGroups。
+	if err := os.Chmod(socketPath, 0o666); err != nil {
 		setupLog.Error(err, "chmod socket failed", "path", socketPath)
 		os.Exit(1)
 	}
