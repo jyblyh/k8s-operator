@@ -1,16 +1,20 @@
 # 示例：同节点两个 host 通过 veth 直连
 #
-# 验证目标：M1 单节点闭环
-#   · controller 看到 VNode 会创建对应同名 Pod，并按 nodeSelector 调度到 worker1
-#   · M1 阶段链路本身还没建（init 容器拨 agent 会失败 → Pod 进 Init:CrashLoopBackOff）
-#     先把 init 注入临时关掉，只验证 Pod 能被创建到正确节点。等 M2 实装 agent
-#     的 SetupLinks 后再开 init，那时 ping 才能通。
+# 验证目标
+# ========
+# **M1 单节点闭环**：controller 把 VNode 翻译成 Pod，落到指定 worker。
+#   · vntopo-init 容器 M1 是 no-op（只打印 env 然后 exit 0）
+#   · 链路本身还没真建，host1 ↔ host2 现阶段 ping 不通
+#   · M2 中 agent 实装 SetupLinks 后，veth pair 才会建好，ping 才通
 #
-# M1 验证步骤：
+# **M2** 完成后预期：进入 host1 容器 `ping 10.0.0.2` 应当能通。
+#
+# 验证命令
+# ========
 #   kubectl apply -f examples/single-host-veth.yaml
-#   kubectl -n demo get pods -o wide   # 期望：host1 / host2 都调度到 k8s-large-1665988239
-#   kubectl get vn -n demo             # 期望：role / dc / phase 列填好
-#   kubectl describe vn host1 -n demo  # 看 status.conditions
+#   kubectl -n demo get pods -o wide   # host1 / host2 都应 Running 在 k8s-large-1665988239
+#   kubectl -n demo get vn             # ROLE / DC / PHASE 列应填好
+#   kubectl -n demo describe vn host1  # Status.Conditions 应有 Ready=True
 
 ---
 apiVersion: v1
@@ -33,12 +37,8 @@ spec:
     metadata: {}
     spec:
       containers:
+        # 容器名按原项目惯例叫 "pod"，方便 datacrawler / 旧脚本通过 spec.containers[?(@.name=="pod")] 取主容器。
         - name: pod
-          # 已搬运到你的 ACR；如果还没搬，先在能访问 dockerhub 的机器上：
-          #   docker pull nicolaka/netshoot:latest
-          #   docker tag  nicolaka/netshoot:latest \
-          #     crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/netshoot:latest
-          #   docker push crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/netshoot:latest
           image: crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/yyc:host-debian
           command: ["sleep", "infinity"]
   links:

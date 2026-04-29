@@ -23,8 +23,8 @@ spec:
         app.kubernetes.io/component: agent
     spec:
       serviceAccountName: vntopo-agent
-      hostNetwork: true
-      hostPID: true
+      hostNetwork: true   # 必需：agent 直接在 host netns 上 LinkAdd 创建 veth
+      hostPID: true       # 必需：通过 /proc/<sandbox-pid>/ns/net 看到 pod netns
       dnsPolicy: ClusterFirstWithHostNet
       tolerations:
         - operator: Exists           # 跑在每个 node 上，包括 master
@@ -35,8 +35,11 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - --socket-path=/var/run/vntopo/agent.sock
+            - --docker-socket=/var/run/docker.sock
+            - --host-proc=/proc
             - --underlay-iface=$(VNTOPO_UNDERLAY_IFACE)
             - --node-name-env=NODE_NAME
+            - --workers=4
           env:
             - name: NODE_NAME
               valueFrom:
@@ -47,23 +50,24 @@ spec:
                 fieldRef:
                   fieldPath: status.hostIP
             - name: VNTOPO_UNDERLAY_IFACE
-              value: ""              # 空 = 自动探测默认路由出接口
+              value: ""              # 空 = M3 中自动探测默认路由出接口
           securityContext:
-            privileged: true         # 操作 netlink / netns / vxlan
+            privileged: true         # 必需：操作 netlink / netns / vxlan
             capabilities:
               add: [NET_ADMIN, SYS_ADMIN, NET_RAW]
           volumeMounts:
+            # init 容器拨进来的 unix socket 暴露目录（双方共用同一 hostPath）
             - name: agent-sock-dir
               mountPath: /var/run/vntopo
+            # 挂载宿主 netns 目录，方便日后 `ip netns add` 类操作（M3 中可能用到）
             - name: host-netns
               mountPath: /var/run/netns
               mountPropagation: HostToContainer
-            # M2/M3 真正建链时再挂载容器运行时 socket。当前集群是 Docker（v1.21）：
-            #   - name: docker-sock
-            #     mountPath: /var/run/docker.sock
-            #   - name: host-proc
-            #     mountPath: /host/proc
-            #     mountPropagation: HostToContainer
+            # M2 关键：调 docker API 找 sandbox 容器拿 PID
+            # 拿到 PID 后用容器自己的 /proc/<pid>/ns/net（hostPID:true 让 /proc
+            # 直接看到宿主进程，所以无需额外 bind /host/proc）
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
           resources:
             requests: { cpu: 50m,  memory: 64Mi }
             limits:   { cpu: 500m, memory: 256Mi }
@@ -76,8 +80,7 @@ spec:
           hostPath:
             path: /var/run/netns
             type: DirectoryOrCreate
-        # M2/M3 时配套上面 volumeMounts 解开：
-        #   - name: docker-sock
-        #     hostPath: { path: /var/run/docker.sock, type: Socket }
-        #   - name: host-proc
-        #     hostPath: { path: /proc, type: Directory }
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket

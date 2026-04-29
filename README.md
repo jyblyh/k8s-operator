@@ -123,26 +123,59 @@ vntopo-operator/
 
 ## 当前状态
 
-**M0：脚手架阶段**
+**M0：脚手架** — ✓ 完成
 
-- [x] 设计文档定稿
-- [x] CRD YAML 草稿
-- [x] `vnode_types.go` 草稿
-- [ ] `kubebuilder init` 生成项目骨架并合并草稿
-- [ ] Makefile / Dockerfile
-- [ ] 基础 RBAC / Deployment / DaemonSet manifest
-- [ ] CI（lint / test / image build）
+**M1：controller 主路径** — ✓ 完成
 
-后续里程碑见 [`docs/roadmap.md`](docs/roadmap.md)。
+- 完整 CRD（VNode）注册并 print column 配置好
+- `validateSpec`、`ensurePod`、`syncStatus + derivePhase + conditions` 全部跑通
+- OwnerReference 级联删除验证通过
+- 单节点 example: host1 + host2 都能调度到指定 worker 并 Running
 
-## 下一步
+**M2：同节点 veth 数据平面** — ✓ 代码完成，待集群验证
+
+变更要点：
+
+- init 容器恢复了真正的 RPC 调用（M1 是 no-op）
+- agent ↔ init 协议改成 **net/rpc + jsonrpc on unix socket**（替代原 gRPC 方案，零 protoc 依赖）
+- agent 内置 **WorkerPool**：RPC 立即返回 `queued`，建链异步进行
+- 同节点 veth 由 **vishvananda/netlink + netns** 直接实现（不再引入 koko）
+- agent 通过 docker.sock REST API 找 Pod sandbox PID，定位 netns
+- VNode.status.linkStatus[] 实时回写每条 link 的 `state / mode / lastError`
+- `LinksConverged` Condition 表示是否本节点所有 link 都建好
+
+**M3：跨节点 VXLAN** — 计划中（每条 link 独立 VNI、underlay 自动探测、drift 扫描自愈）
+
+详见 [`docs/roadmap.md`](docs/roadmap.md)。
+
+## 验证 M2
 
 ```bash
-# 1. 安装 kubebuilder（v3+）和 controller-gen
-# 2. 在本目录初始化项目（会与现有草稿合并）
-kubebuilder init --domain bupt.site --repo github.com/<your-org>/vntopo-operator
-kubebuilder create api --group vntopo --version v1alpha1 --kind VNode --resource --controller
-# 3. 把 api/v1alpha1/vnode_types.go 草稿合并进 kubebuilder 生成的版本
-make generate manifests
-make docker-build IMG=vntopo-controller:dev
+# 0. 把 agent + init 镜像重新打包推到 ACR（go.mod 加了 netlink/netns）
+make docker-build-agent docker-push-agent
+make docker-build-init  docker-push-init
+
+# 1. 集群已经在跑 M1 的话，重新 deploy（CRD 没变，只滚 Deployment / DaemonSet）
+make deploy
+
+# 2. 部署示例
+kubectl apply -f examples/single-host-veth.yaml
+
+# 3. 等 Pod Ready，进 host1 ping host2
+kubectl -n demo exec host1 -c pod -- ping -c 3 10.0.0.2
+# 期望：3 packets transmitted, 3 received, 0% packet loss
+
+# 4. 看 status.linkStatus 验证 controller/agent 协同
+kubectl -n demo get vn host1 -o yaml | sed -n '/status:/,$p'
+# 期望看到：
+#   linkStatus:
+#     - uid: 1
+#       peer_pod: host2
+#       state: Established
+#       mode: veth
+#       establishedAt: ...
+#   conditions:
+#     - type: LinksConverged
+#       status: "True"
+#       reason: AllVethEstablished
 ```

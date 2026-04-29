@@ -12,21 +12,22 @@ go 1.19
 //     （client 至多比 server 高 1 个 minor，v0.23.x → 1.21–1.23 server）。
 //   · sigs.k8s.io/controller-runtime v0.11.2 明确支持 K8s 1.21–1.23，
 //     并且自带 metav1.Condition / meta.SetStatusCondition 等我们用到的 API。
-//   · grpc v1.58.3 / protobuf v1.31.0：解决 google.golang.org/genproto
-//     在 2024 年拆分子模块后，旧 grpc + 新 koko 同时拉两份导致的 ambiguous import。
-//   · 后续如果集群升级到 1.24+，可同步上调到 controller-runtime v0.13+ / k8s 0.25+。
+//   · vishvananda/netlink v1.1.0 + netns v0.0.4：M2 同节点 veth 创建用，
+//     社区主流且稳定。MakeVethPair 内部直接调 LinkAdd / LinkSetNsFd，
+//     不再引入 koko 这一层薄封装（依赖更少、行为更可控）。
+//   · grpc 在 M2 已经不直接使用（init↔agent 改成 net/rpc + jsonrpc），
+//     但 controller-runtime 的间接依赖仍然可能拉它，留着不影响。
 //
 // 注意：
-//   · netlink / netns / koko 等"真正用 netlink 操作宿主机网络"的库，
-//     等 M1 写 internal/agent/netlink_veth.go 时再加进来。
-//     届时建议用 p2pnet 同款 `github.com/karkar0813/koko`（fork，比 redhat-nfvpe/koko 活跃）。
 //   · 真实依赖列表与子依赖以 `go mod tidy` 结果为准。
+//   · 集群升级到 1.24+ 后，可同步上调到 controller-runtime v0.13+ / k8s 0.25+，
+//     并把 cri 接口从 docker shim 迁到 containerd CRI。
 // =====================================================================
 require (
 	github.com/go-logr/logr v1.2.0
 	github.com/spf13/pflag v1.0.5
-	google.golang.org/grpc v1.58.3
-	google.golang.org/protobuf v1.31.0
+	github.com/vishvananda/netlink v1.1.0
+	github.com/vishvananda/netns v0.0.4
 	k8s.io/api v0.23.5
 	k8s.io/apimachinery v0.23.5
 	k8s.io/client-go v0.23.5

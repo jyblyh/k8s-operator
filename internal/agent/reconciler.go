@@ -3,20 +3,18 @@ Copyright 2026 BUPT AIOps Lab.
 */
 
 // Package agent 实现节点级数据平面：
-//   - watch 本节点 Pod 对应的 VNode
-//   - same-host 用 veth pair（复用 koko）
-//   - cross-host 用 vxlan + bridge
-//   - 周期 drift 扫描 + 自愈
-//   - 通过 unix socket gRPC 接收 init 容器调用
+//   - 通过 unix socket jsonrpc 接收 init 容器的 SetupLinks 调用
+//   - watch 本节点上 Pod 对应的 VNode，作为 RPC 路径之外的兜底重建
+//   - 异步 worker pool 真正执行 veth/vxlan 操作
+//   - same-host 用 veth pair（M2 已实现，netlink + netns）
+//   - cross-host 用 vxlan + bridge（M3）
+//   - 周期 drift 扫描 + 自愈（M3）
 package agent
 
 import (
 	"context"
-	"net"
 
-	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -28,45 +26,82 @@ import (
 	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
 )
 
-// Reconciler 在每个 worker 节点上跑，处理本节点 Pod 的链路 diff & apply。
+// Reconciler 在每个 worker 节点上跑，把本节点 Pod 相关的 VNode 事件转换成
+// SetupTask 推到 WorkerPool。真正建链由 SetupHandler 完成。
+//
+// 与 RPC 路径的关系
+// =================
+//
+// init 容器的 RPC SetupLinks 是 **常态触发**：Pod 起来时初始化建链。
+//
+// reconciler watch 是 **兜底**：
+//   - 对端 VNode 后建：本端先建好 link 时对端不存在，Pending；对端创建后
+//     reconciler 收到 VNode 事件，把它的所有邻居重新入队
+//   - drift 扫描（M3）：周期性 enqueue 本节点全部 VNode，agent 自愈
+//
+// 因此 reconciler 不直接调 netlink，只负责 enqueue。
 type Reconciler struct {
 	client.Client
 
-	NodeName      string
-	UnderlayIface string
+	NodeName  string
+	Pool      *WorkerPool
+	Predicate func(p *corev1.Pod) bool // 可选：测试用
 }
 
-// Reconcile 处理一次 VNode 变更。
+// Reconcile 处理一次 VNode 变更：把变更对象自身 + 它的邻居全部入队。
 //
-// M0 仅打日志骨架；M1/M2 中接入实际的 veth/vxlan 操作。
+// 入队的是 Pod-级任务，handler 自己读最新 spec，所以这里不需要传 link 详情。
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("node", r.NodeName)
 
 	var vn vntopov1alpha1.VNode
 	if err := r.Get(ctx, req.NamespacedName, &vn); err != nil {
+		// 删了：放手让 OwnerReferences/finalizer 走 controller 那边
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// 只处理 Pod 调度到本节点的 VNode。
-	if vn.Status.HostNode != r.NodeName {
+	// 只关心本节点 VNode（status.hostNode 兜底用 nodeSelector）
+	if !r.belongsToThisNode(&vn) {
 		return ctrl.Result{}, nil
 	}
 
-	// TODO(M1):
-	//   desired := vn.Spec.Links
-	//   actual  := scanLocalDevices(vn)
-	//   for link in desired:
-	//       peer = get(vn.namespace, link.peer_pod)
-	//       if peer.hostNode == r.NodeName: makeVeth(...)
-	//       else:                            makeVXLAN(..., vni from status)
-	//   清理孤儿设备
-	//   patch status.linkStatus[*]
+	if err := r.Pool.Enqueue(SetupTask{
+		Namespace: vn.Namespace,
+		PodName:   vn.Name,
+	}); err != nil {
+		// queue 满 → 不阻塞 controller-runtime 队列，下次 reconcile 再试
+		logger.Error(err, "enqueue task failed; will retry on next reconcile")
+		return ctrl.Result{Requeue: true}, nil
+	}
 
-	logger.V(1).Info("agent reconciled", "vnode", vn.Name)
+	// 邻居：当前 vn 状态变化（比如刚被调度）会影响邻居 LinksConverged，
+	// 把同 namespace 内 spec.links.peer_pod 引用到 vn 的 VNode 也入队。
+	// 简化做法：只入队 vn.spec.links 的对端；对面如果也指向我，他自己 reconcile
+	// 会走对称路径。
+	for _, link := range vn.Spec.Links {
+		_ = r.Pool.Enqueue(SetupTask{
+			Namespace: vn.Namespace,
+			PodName:   link.PeerPod,
+		})
+	}
+
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager 注册 watch；通过 fieldSelector 限定只接收本节点 Pod 对应的 VNode。
+// belongsToThisNode 同 SetupHandler 同名方法的简化版，避免循环依赖。
+func (r *Reconciler) belongsToThisNode(vn *vntopov1alpha1.VNode) bool {
+	if vn.Status.HostNode == r.NodeName {
+		return true
+	}
+	if vn.Spec.NodeSelector != nil {
+		if v, ok := vn.Spec.NodeSelector["kubernetes.io/hostname"]; ok && v == r.NodeName {
+			return true
+		}
+	}
+	return false
+}
+
+// SetupWithManager 注册 watch；通过 predicate 限定只接收本节点 Pod 对应的 VNode。
 //
 // 注意：controller-runtime v0.11.x 的 Watches 需要 source.Kind 包装；
 // MapFunc 不接收 ctx（v0.15+ 才加上）。
@@ -88,25 +123,4 @@ func (r *Reconciler) mapPodToVNode(obj client.Object) []reconcile.Request {
 			NamespacedName: client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()},
 		},
 	}
-}
-
-// 为后续 cache 配置预留：让 mgr 给 Pod 在 spec.nodeName 上建索引。
-//
-// 在 cmd/agent/main.go 里 manager 启动前可：
-//
-//	mgr.GetCache().IndexField(ctx, &corev1.Pod{}, "spec.nodeName",
-//	    func(o client.Object) []string {
-//	        return []string{o.(*corev1.Pod).Spec.NodeName}
-//	    })
-//
-// M1 中再启用，避免 M0 启动期失败。
-var _ = fields.OneTermEqualSelector
-
-// RunGRPCServer 在给定 listener 上跑 unix socket gRPC server，接收 init 容器调用。
-//
-// M0 仅注册一个空 server；M1 中实现 SetupLink 接口（兼容 p2pnet 协议）。
-func RunGRPCServer(lis net.Listener, r *Reconciler) error {
-	srv := grpc.NewServer()
-	// TODO(M1): netservicepb.RegisterLocalServer(srv, &grpcHandler{reconciler: r})
-	return srv.Serve(lis)
 }
