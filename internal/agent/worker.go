@@ -27,9 +27,13 @@ type SetupTask struct {
 	EnqueuedAt time.Time
 }
 
-// SetupHandler 真正干活的回调：拿到一个任务，建好这个 Pod 的所有同节点 link，
+// SetupTaskFunc 真正干活的回调：拿到一个任务，建好这个 Pod 的所有同节点 link，
 // 写回 status，然后返回。出错时返回 error，由 worker 决定是否 requeue。
-type SetupHandler func(ctx context.Context, task SetupTask) error
+//
+// 注意：本类型故意不叫 SetupHandler——同包里 setup_handler.go 已经有
+// `type SetupHandler struct` 表示具体实现对象；这里要的是它的方法签名抽象，
+// 改名避免类型重名冲突。实例化时传 handler.Handle 即可。
+type SetupTaskFunc func(ctx context.Context, task SetupTask) error
 
 // WorkerPool 是固定大小的 goroutine 池 + 一个有界 channel。
 //
@@ -39,7 +43,7 @@ type SetupHandler func(ctx context.Context, task SetupTask) error
 //   - 失败重试：worker 内部退避重试 N 次，再不行写 status.lastError
 type WorkerPool struct {
 	tasks   chan SetupTask
-	handler SetupHandler
+	handler SetupTaskFunc
 
 	maxRetry  int           // 单任务最多重试几次
 	retryWait time.Duration // 重试间隔（指数退避基线）
@@ -51,7 +55,7 @@ type WorkerPool struct {
 }
 
 // NewWorkerPool 创建一个池但不启动。size = 同时处理的任务数；queue = 排队上限。
-func NewWorkerPool(size, queue int, handler SetupHandler) *WorkerPool {
+func NewWorkerPool(size, queue int, handler SetupTaskFunc) *WorkerPool {
 	if size <= 0 {
 		size = 4
 	}

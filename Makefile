@@ -1,5 +1,9 @@
 # Image registry & tags
-REGISTRY        ?= docker.io/bupt-aiops
+#
+# 默认指向你的阿里云 ACR 个人实例（cn-beijing），所有 build/push/deploy 都按这个走。
+# 临时改 registry 时直接 override，例如：
+#   make REGISTRY=docker.io/myname docker-build-agent
+REGISTRY        ?= crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209
 TAG             ?= dev
 IMG_CONTROLLER  ?= $(REGISTRY)/vntopo-controller:$(TAG)
 IMG_AGENT       ?= $(REGISTRY)/vntopo-agent:$(TAG)
