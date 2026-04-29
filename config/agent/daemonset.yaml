@@ -32,7 +32,8 @@ spec:
       containers:
         - name: agent
           image: agent:dev           # 由 kustomize edit set image 替换
-          imagePullPolicy: IfNotPresent
+          # dev 阶段固定 :dev tag，每次 push 后 rollout restart 即重新拉取。
+          imagePullPolicy: Always
           args:
             - --socket-path=/var/run/vntopo/agent.sock
             - --docker-socket=/var/run/docker.sock

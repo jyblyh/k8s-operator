@@ -49,10 +49,14 @@ func renderPod(vn *vntopov1alpha1.VNode, initImage string, scheme *runtime.Schem
 		pod.Spec.Affinity = vn.Spec.Affinity.DeepCopy()
 	}
 
-	// 注入 init 容器（M1 中具体填充 env / mount，参考 p2pnet/client）
+	// 注入 init 容器：拨本节点 agent 触发建链。
+	//
+	// imagePullPolicy=Always：dev 阶段固定 :dev tag，每次 push 镜像后下次 Pod 创建
+	// 都会从 registry 重新拉，无需手动清节点缓存。生产可以改成 IfNotPresent。
 	pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
-		Name:  common.InitContainerName,
-		Image: initImage,
+		Name:            common.InitContainerName,
+		Image:           initImage,
+		ImagePullPolicy: corev1.PullAlways,
 		Env: []corev1.EnvVar{
 			{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},

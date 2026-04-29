@@ -26,7 +26,9 @@ spec:
       containers:
       - name: controller
         image: controller:dev    # 由 kustomize edit set image 替换
-        imagePullPolicy: IfNotPresent
+        # dev 阶段固定 :dev tag，每次 push 后 rollout restart 即重新拉取。
+        # 切到生产/release tag（vX.Y.Z）时再改回 IfNotPresent。
+        imagePullPolicy: Always
         args:
           # M1 阶段单副本，关掉 leader-election；后续多副本 HA 时翻回 true
           # 即可（配合下面 RBAC 里 configmaps + leases 权限自动生效）。
