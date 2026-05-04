@@ -87,21 +87,26 @@ func mergeLinkStatusByUID(prev, newer []vntopov1alpha1.LinkStatus) []vntopov1alp
 
 // setLinksConvergedCondition 把汇总的链路状态写到 conditions[type=LinksConverged]。
 //
-// 语义：所有本节点能处理的 link 全部 Established → status=True；
-// 任一 Error → status=False，reason=LinkError；
-// 否则（Pending/跨节点跳过）→ status=False，reason=Progressing。
+// 语义（M3 起 veth 与 vxlan 一视同仁，都纳入收敛判断）：
+//   - 全部 Established → status=True, reason=AllLinksEstablished
+//   - 任一 Error       → status=False, reason=LinkError
+//   - 否则 Pending     → status=False, reason=Progressing
 func setLinksConvergedCondition(vn *vntopov1alpha1.VNode, results []vntopov1alpha1.LinkStatus) {
-	totalLocal := 0
+	total := 0
 	established := 0
+	veth := 0
+	vxlan := 0
 	hasError := false
 	var firstErrMsg string
 
 	for _, s := range results {
-		// 跨节点 link M2 不处理，不计入收敛与否的判断
-		if s.Mode == vntopov1alpha1.LinkModeVXLAN {
-			continue
+		total++
+		switch s.Mode {
+		case vntopov1alpha1.LinkModeVeth:
+			veth++
+		case vntopov1alpha1.LinkModeVXLAN:
+			vxlan++
 		}
-		totalLocal++
 		switch s.State {
 		case vntopov1alpha1.LinkStateEstablished:
 			established++
@@ -123,14 +128,16 @@ func setLinksConvergedCondition(vn *vntopov1alpha1.VNode, results []vntopov1alph
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = "LinkError"
 		cond.Message = firstErrMsg
-	case totalLocal > 0 && established == totalLocal:
+	case total > 0 && established == total:
 		cond.Status = metav1.ConditionTrue
-		cond.Reason = "AllVethEstablished"
-		cond.Message = fmt.Sprintf("%d/%d local veth links established", established, totalLocal)
+		cond.Reason = "AllLinksEstablished"
+		cond.Message = fmt.Sprintf("%d/%d links established (veth=%d, vxlan=%d)",
+			established, total, veth, vxlan)
 	default:
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = "Progressing"
-		cond.Message = fmt.Sprintf("%d/%d local veth links established", established, totalLocal)
+		cond.Message = fmt.Sprintf("%d/%d links established (veth=%d, vxlan=%d)",
+			established, total, veth, vxlan)
 	}
 
 	meta.SetStatusCondition(&vn.Status.Conditions, cond)

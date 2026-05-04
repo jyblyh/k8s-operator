@@ -40,7 +40,9 @@ spec:
             - --host-proc=/proc
             - --underlay-iface=$(VNTOPO_UNDERLAY_IFACE)
             - --node-name-env=NODE_NAME
+            - --node-ip-env=NODE_IP
             - --workers=4
+            - --drift-scan-sec=60
           env:
             - name: NODE_NAME
               valueFrom:

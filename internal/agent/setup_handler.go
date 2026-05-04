@@ -7,6 +7,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"time"
 
@@ -16,10 +17,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
+	"github.com/jyblyh/k8s-operator/internal/common"
 )
 
 // SetupHandler 是 worker / reconciler 共用的核心：给定一个本节点 Pod，
-// 把它在 spec.links 中声明的所有**同节点**链路建好，并把结果写回 status。
+// 把它在 spec.links 中声明的所有链路（同节点 + 跨节点）建好，
+// 并把结果写回 status。
 //
 // 设计原则
 //
@@ -27,10 +30,12 @@ import (
 //     对端 VNode 的 status——对端有自己的 init 容器/reconciler 会触发自己
 //     的 SetupHandler 来写。这样两端权限严格分离，避免 patch 冲突。
 //
-//   - **跨节点 link 这里跳过**：M2 暂不实现 VXLAN，跳过的 link 在 status 里
-//     标 state=Pending + reason=CrossNodeLinkDeferredToM3。
+//   - **同节点 link 走 veth**（M2）；**跨节点 link 走 P2P VXLAN**（M3）。
+//     双方各起一个 vxlan 设备，VNI 由 ComputeVNI(namespace, uid) 决定，
+//     无需协商。
 //
-//   - **幂等**：MakeVethPair 自带幂等；handler 自身也容忍部分失败重试。
+//   - **幂等**：MakeVethPair / MakeVxlanLink 自带幂等检查；handler 自身
+//     也容忍部分失败重试。
 type SetupHandler struct {
 	// Client 是 cache-backed client（来自 mgr.GetClient）。用于写：Status().Update。
 	Client client.Client
@@ -44,9 +49,12 @@ type SetupHandler struct {
 	Netns    *PodNetns
 	Locks    *LinkLocks
 
-	// UnderlayIface 留给 M3 跨节点 VXLAN 使用：cross-node link 需要在这块网卡上
-	// 起 vxlan 设备。M2 暂未使用。
-	UnderlayIface string
+	// Underlay 描述本节点跨节点 VXLAN 走哪张网卡、什么 src IP、什么 MTU。
+	// 由 cmd/agent 启动时探测一次后注入。
+	Underlay *Underlay
+
+	// NodeIP 用来解析对端 Node 的 InternalIP（vxlan remote）。
+	NodeIP *NodeIPResolver
 }
 
 // Handle 是 worker pool 调用的入口。返回 error 让 worker 走重试逻辑。
@@ -66,8 +74,6 @@ func (h *SetupHandler) Handle(ctx context.Context, task SetupTask) error {
 	}
 
 	// 2) 校验 VNode 真的归本节点处理
-	//    （一般 controller 已经把 status.hostNode 写好了；如果还没写，
-	//    我们用 spec.nodeSelector 兜底匹配）
 	if !h.belongsToThisNode(&vn) {
 		logger.V(1).Info("vnode not on this node, skip")
 		return nil
@@ -112,7 +118,19 @@ func (h *SetupHandler) belongsToThisNode(vn *vntopov1alpha1.VNode) bool {
 	return false
 }
 
-// handleOneLink 处理单条 link：找对端 → 同/跨节点分流 → 同节点建 veth。
+// peerNodeOf 推断对端 VNode 跑在哪个 K8s 节点上。
+// 优先 status.hostNode；fallback spec.nodeSelector。
+func (h *SetupHandler) peerNodeOf(peer *vntopov1alpha1.VNode) string {
+	if peer.Status.HostNode != "" {
+		return peer.Status.HostNode
+	}
+	if peer.Spec.NodeSelector != nil {
+		return peer.Spec.NodeSelector["kubernetes.io/hostname"]
+	}
+	return ""
+}
+
+// handleOneLink 处理单条 link：找对端 → 同/跨节点分流 → 同节点建 veth / 跨节点建 vxlan。
 func (h *SetupHandler) handleOneLink(
 	ctx context.Context,
 	localVN *vntopov1alpha1.VNode,
@@ -134,34 +152,38 @@ func (h *SetupHandler) handleOneLink(
 	var peer vntopov1alpha1.VNode
 	peerKey := types.NamespacedName{Namespace: localVN.Namespace, Name: link.PeerPod}
 	if err := h.Reader.Get(ctx, peerKey, &peer); err != nil {
-		st.State = vntopov1alpha1.LinkStateError
-		st.LastError = fmt.Sprintf("peer vnode not found: %v", err)
-		logger.V(1).Info("peer not yet available, link pending")
 		// 对端还没创建是常态（双方 init 几乎同时 SetupLinks），不视作硬错误
 		// 留 Pending，下次 reconcile 再试
+		logger.V(1).Info("peer not yet available, link pending", "err", err)
 		st.State = vntopov1alpha1.LinkStatePending
 		st.LastError = "peer not ready"
 		return st
 	}
 
-	// 跨节点：M3 才实现 VXLAN，先跳过
-	peerNode := peer.Status.HostNode
-	if peerNode == "" && peer.Spec.NodeSelector != nil {
-		peerNode = peer.Spec.NodeSelector["kubernetes.io/hostname"]
-	}
-	if peerNode != h.NodeName {
-		st.State = vntopov1alpha1.LinkStatePending
-		st.Mode = vntopov1alpha1.LinkModeVXLAN
-		st.LastError = "cross-node link deferred to M3 (VXLAN)"
-		logger.V(1).Info("cross-node link skipped")
-		return st
-	}
+	peerNode := h.peerNodeOf(&peer)
 
 	// per-link 互斥锁（同 namespace 内 uid 唯一），避免双方同时建链冲突
 	unlock := h.Locks.Lock(localVN.Namespace, link.UID)
 	defer unlock()
 
-	// 解析对端 netns
+	if peerNode == h.NodeName {
+		// === 同节点：veth pair ===
+		return h.handleSameNodeVeth(ctx, &peer, link, localNs, st)
+	}
+	// === 跨节点：P2P VXLAN ===
+	return h.handleCrossNodeVxlan(ctx, &peer, peerNode, link, localNs, st)
+}
+
+// handleSameNodeVeth 维持 M2 行为：进对端 netns，建 veth pair。
+func (h *SetupHandler) handleSameNodeVeth(
+	ctx context.Context,
+	peer *vntopov1alpha1.VNode,
+	link vntopov1alpha1.LinkSpec,
+	localNs string,
+	st vntopov1alpha1.LinkStatus,
+) vntopov1alpha1.LinkStatus {
+	logger := log.FromContext(ctx)
+
 	peerNs, err := h.Netns.LookupPath(ctx, peer.Namespace, peer.Name)
 	if err != nil {
 		st.State = vntopov1alpha1.LinkStateError
@@ -169,7 +191,6 @@ func (h *SetupHandler) handleOneLink(
 		return st
 	}
 
-	// 真正建链
 	tmpSuffix := strconv.FormatInt(link.UID, 10)
 	if err := MakeVethPair(
 		localNs, peerNs,
@@ -183,10 +204,91 @@ func (h *SetupHandler) handleOneLink(
 	}
 
 	now := nowMetav1()
+	st.Mode = vntopov1alpha1.LinkModeVeth
 	st.State = vntopov1alpha1.LinkStateEstablished
 	st.LastError = ""
 	st.EstablishedAt = &now
 	logger.Info("veth link established",
 		"local_intf", link.LocalIntf, "peer_intf", link.PeerIntf)
+	return st
+}
+
+// handleCrossNodeVxlan 在本端 pod netns 起一个 P2P VXLAN 设备指向对端节点。
+//
+// 操作只在本节点完成（VXLAN 是双向独立、对称的）：
+//
+//   - VNI = ComputeVNI(namespace, uid) → 双方算出同一个值
+//   - Local = 本节点 underlay IP（启动时探测）
+//   - Remote = 对端节点 InternalIP（K8s API 查 Node 拿）
+//   - dev = 本节点 underlay 网卡 ifindex
+//
+// 对端 agent 看到对端 VNode 后会做对称的事，用同一个 VNI 建出指向我方的
+// 设备 → 通信成立。
+func (h *SetupHandler) handleCrossNodeVxlan(
+	ctx context.Context,
+	peer *vntopov1alpha1.VNode,
+	peerNode string,
+	link vntopov1alpha1.LinkSpec,
+	localNs string,
+	st vntopov1alpha1.LinkStatus,
+) vntopov1alpha1.LinkStatus {
+	logger := log.FromContext(ctx).WithValues("peer_node", peerNode)
+
+	st.Mode = vntopov1alpha1.LinkModeVXLAN
+
+	if peerNode == "" {
+		st.State = vntopov1alpha1.LinkStatePending
+		st.LastError = "peer node unknown (status.hostNode/nodeSelector both empty)"
+		return st
+	}
+
+	if h.Underlay == nil {
+		st.State = vntopov1alpha1.LinkStateError
+		st.LastError = "agent underlay not initialized"
+		return st
+	}
+
+	// 解析对端节点 underlay IP
+	peerIP, err := h.NodeIP.LookupNodeIP(ctx, peerNode)
+	if err != nil {
+		st.State = vntopov1alpha1.LinkStatePending
+		st.LastError = fmt.Sprintf("lookup peer node ip: %v", err)
+		return st
+	}
+	peerIPParsed := net.ParseIP(peerIP)
+	if peerIPParsed == nil {
+		st.State = vntopov1alpha1.LinkStateError
+		st.LastError = fmt.Sprintf("peer node ip %q invalid", peerIP)
+		return st
+	}
+
+	vni := common.ComputeVNI(peer.Namespace, link.UID)
+
+	if err := MakeVxlanLink(VxlanParams{
+		VNI:         vni,
+		Local:       h.Underlay.LocalIP,
+		Remote:      peerIPParsed,
+		UnderlayIdx: h.Underlay.IfaceIdx,
+		UnderlayMTU: h.Underlay.MTU,
+		DstPort:     common.VXLANDefaultPort,
+		PodNsPath:   localNs,
+		IntfName:    link.LocalIntf,
+		CIDR:        link.LocalIP,
+	}); err != nil {
+		st.State = vntopov1alpha1.LinkStateError
+		st.LastError = err.Error()
+		st.VNI = vni
+		st.UnderlayIP = peerIP
+		return st
+	}
+
+	now := nowMetav1()
+	st.State = vntopov1alpha1.LinkStateEstablished
+	st.LastError = ""
+	st.VNI = vni
+	st.UnderlayIP = peerIP
+	st.EstablishedAt = &now
+	logger.Info("vxlan link established",
+		"local_intf", link.LocalIntf, "vni", vni, "remote", peerIP)
 	return st
 }

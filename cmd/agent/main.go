@@ -7,10 +7,11 @@ Copyright 2026 BUPT AIOps Lab.
 // 启动后做的事
 // ============
 //  1. 读取本节点身份（NODE_NAME 环境变量，由 DaemonSet 注入 fieldRef）
-//  2. 启动 controller-runtime manager，watch 本节点上有 Pod 的 VNode
-//  3. 启动 jsonrpc unix socket server，接受 init 容器的 SetupLinks 请求
-//  4. 启动异步 WorkerPool：消费 SetupTask，调 SetupHandler 真正建链
-//  5. 周期 drift 扫描（M3 中加入）
+//  2. 探测 underlay 网卡（M3 起：vxlan 设备需要它）
+//  3. 启动 controller-runtime manager，watch 本节点上有 Pod 的 VNode
+//  4. 启动 jsonrpc unix socket server，接受 init 容器的 SetupLinks 请求
+//  5. 启动异步 WorkerPool：消费 SetupTask，调 SetupHandler 真正建链
+//  6. 启动 drift scanner 周期巡检（M3）
 package main
 
 import (
@@ -18,6 +19,7 @@ import (
 	"flag"
 	"net"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -45,10 +47,12 @@ func main() {
 		socketPath     string
 		dockerSocket   string
 		hostProcPrefix string
-		underlayIface  string // M3 使用
+		underlayIface  string
 		nodeNameEnvKey string
+		nodeIPEnvKey   string
 		workerSize     int
 		workerQueueCap int
+		driftIntervalS int
 	)
 	flag.StringVar(&socketPath, "socket-path", common.AgentSocketPath,
 		"Unix socket path that init containers use to call this agent.")
@@ -57,11 +61,15 @@ func main() {
 	flag.StringVar(&hostProcPrefix, "host-proc", "/proc",
 		"Host /proc prefix. Set to /host/proc when bind-mounted.")
 	flag.StringVar(&underlayIface, "underlay-iface", "",
-		"Underlay interface name used by VXLAN devices. Empty => auto-detect default route.")
+		"Underlay interface name used by VXLAN devices. Empty => auto-detect (NODE_IP first, then default route).")
 	flag.StringVar(&nodeNameEnvKey, "node-name-env", "NODE_NAME",
 		"Env var that holds the kubernetes node name this agent runs on.")
+	flag.StringVar(&nodeIPEnvKey, "node-ip-env", "NODE_IP",
+		"Env var that holds the kubernetes node InternalIP (used as VXLAN src).")
 	flag.IntVar(&workerSize, "workers", 4, "Concurrent worker goroutines.")
 	flag.IntVar(&workerQueueCap, "worker-queue", 256, "Max pending tasks queued.")
+	flag.IntVar(&driftIntervalS, "drift-scan-sec", common.AgentDriftScanSec,
+		"Drift scan interval in seconds. <=0 disables.")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -73,6 +81,15 @@ func main() {
 		setupLog.Error(nil, "node name env not set", "env", nodeNameEnvKey)
 		os.Exit(1)
 	}
+	nodeIP := os.Getenv(nodeIPEnvKey) // 可空，由 DetectUnderlay 兜底走默认路由
+
+	// ---- underlay 探测：vxlan 设备依赖它，启动时一锤定音
+	underlay, err := agent.DetectUnderlay(underlayIface, nodeIP)
+	if err != nil {
+		setupLog.Error(err, "detect underlay failed", "iface_hint", underlayIface, "node_ip", nodeIP)
+		os.Exit(1)
+	}
+	setupLog.Info("underlay detected", "underlay", underlay.String())
 
 	// ---- controller-runtime manager（agent 不做 leader election，每个节点都要跑）
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -87,17 +104,20 @@ func main() {
 	// ---- 数据平面：docker → netns → setup handler
 	dockerCli := agent.NewDockerClient(dockerSocket)
 	podNetns := agent.NewPodNetns(dockerCli, hostProcPrefix)
+	// Node IP 解析走 APIReader 直连 apiserver，避免引入全集群 Node informer
+	nodeIPResolver := &agent.NodeIPResolver{Reader: mgr.GetAPIReader()}
 
 	handler := &agent.SetupHandler{
-		Client:        mgr.GetClient(),
-		Reader:        mgr.GetAPIReader(), // bypass cache，启动早期也能读到 VNode
-		NodeName:      nodeName,
-		Netns:         podNetns,
-		Locks:         agent.NewLinkLocks(),
-		UnderlayIface: underlayIface, // M3 才会真正用到
+		Client:   mgr.GetClient(),
+		Reader:   mgr.GetAPIReader(), // bypass cache，启动早期也能读到 VNode
+		NodeName: nodeName,
+		Netns:    podNetns,
+		Locks:    agent.NewLinkLocks(),
+		Underlay: underlay,
+		NodeIP:   nodeIPResolver,
 	}
 
-	// ---- worker pool：RPC server / reconciler 共享同一个池
+	// ---- worker pool：RPC server / reconciler / drift scan 共享同一个池
 	pool := agent.NewWorkerPool(workerSize, workerQueueCap, handler.Handle)
 
 	// ---- reconciler：watch VNode/Pod，把变化推到 pool
@@ -123,16 +143,13 @@ func main() {
 		os.Exit(1)
 	}
 	// socket 权限 0666：init 容器（distroless/static:nonroot, UID=65532）也得能连。
-	// 这个 socket 在 hostPath /var/run/vntopo 下，只有挂载了同一 hostPath 的容器
-	// 才能 reach（DaemonSet 自身 + 我们注入的 init 容器），不存在外部用户连进来
-	// 的风险。生产可以改成 0660 + 给 init 容器 spec 加 supplementalGroups。
 	if err := os.Chmod(socketPath, 0o666); err != nil {
 		setupLog.Error(err, "chmod socket failed", "path", socketPath)
 		os.Exit(1)
 	}
 	netSvc := agent.NewNetService(pool.Enqueue)
 
-	// ---- 启动顺序：先 worker，再 RPC server，最后 manager（manager 是 blocking call）
+	// ---- 启动顺序：先 worker，再 RPC server，再 drift scanner，最后 manager（manager 是 blocking call）
 	rootCtx, cancelRoot := context.WithCancel(ctrl.SetupSignalHandler())
 	defer cancelRoot()
 
@@ -150,9 +167,20 @@ func main() {
 		}
 	}()
 
+	if driftIntervalS > 0 {
+		ds := &agent.DriftScanner{
+			Reader:   mgr.GetAPIReader(),
+			NodeName: nodeName,
+			Pool:     pool,
+			Interval: time.Duration(driftIntervalS) * time.Second,
+		}
+		go ds.Run(rootCtx)
+	}
+
 	setupLog.Info("starting agent manager",
 		"node", nodeName, "socket", socketPath, "workers", workerSize,
-		"docker", dockerSocket, "host_proc", hostProcPrefix)
+		"docker", dockerSocket, "host_proc", hostProcPrefix,
+		"underlay", underlay.IfaceName, "drift_sec", driftIntervalS)
 	if err := mgr.Start(rootCtx); err != nil {
 		setupLog.Error(err, "manager exited with error")
 		os.Exit(1)

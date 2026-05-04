@@ -1,70 +1,88 @@
-# 示例：跨节点路由器对接（VXLAN）
+# 示例：跨节点两个 host 通过 P2P VXLAN 互连
 #
-# 拓扑：
-#   r1 (调度到 node1) ────VXLAN───── r2 (调度到 node2)
+# 验证目标
+# ========
+# **M3 跨节点链路闭环**：
+#   · host1 强制调度到 worker A，host2 强制调度到 worker B
+#   · agent 在两端各自建一个 VXLAN 设备，VNI = ComputeVNI("demo", uid=1)
+#   · 跨节点流量经 underlay 网卡走 UDP 4789，应当 ping 通
 #
-# 验证目标：M2 跨节点 VXLAN 闭环
+# 调度
+# ====
+# 故意给 host1 / host2 设置不同的 nodeSelector：原项目里"同 DC 同节点"
+# 是约定俗成，但 M3 跨节点功能本身不绑定 DC——这里两个 host 用不同 DC
+# 来形容"两个独立数据中心通过路由器互连"的真实拓扑（M3 测试简化为
+# 两个 host 直连，不引入路由器）。
+#
+# 验证命令
+# ========
 #   kubectl apply -f examples/cross-host-vxlan.yaml
-#   kubectl wait --for=condition=PodReady pod/r1 -n demo --timeout=120s
-#   kubectl wait --for=condition=PodReady pod/r2 -n demo --timeout=120s
-#   kubectl exec -n demo r1 -- ping -c 3 192.168.0.2
+#   kubectl -n demo-x get pods -o wide       # host1 / host2 应分别落到不同 worker
+#   kubectl -n demo-x get vn                 # PHASE 应为 Ready
+#   kubectl -n demo-x get vn host1 -o yaml   # status.linkStatus[*].mode=vxlan, vni 非零
+#   kubectl -n demo-x exec host1 -c pod -- ping -c 3 10.1.0.2
+#   kubectl -n demo-x exec host2 -c pod -- ping -c 3 10.1.0.1
+#
+# 排错
+# ====
+#   节点 A：tcpdump -ni eth0 'udp port 4789'  应看到 vxlan 包来回
+#   节点 A：ip -d link show vx<vni>           查看 vxlan 设备配置（在 pod ns 内 ip a 看）
+#   双方  ：kubectl -n vntopo-system logs -l app.kubernetes.io/component=agent | grep vxlan
 
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: demo
+  name: demo-x
 
 ---
-# r1 强制调度到 node1
 apiVersion: vntopo.bupt.site/v1alpha1
 kind: VNode
 metadata:
-  name: r1
-  namespace: demo
+  name: host1
+  namespace: demo-x
 spec:
-  role: r
-  # 路由器一般不指定 dataCenter，由 K8s 自由调度；
-  # 这个示例为了测试可重复性，显式指定 nodeSelector。
+  role: host
+  dataCenter: dc1
   nodeSelector:
-    kubernetes.io/hostname: aiops-k8s1
+    kubernetes.io/hostname: k8s-large-1665988239   # worker A：替换成你集群里实际的节点名
   template:
     metadata: {}
     spec:
       containers:
-        - name: net
-          image: nicolaka/netshoot:latest
+        - name: pod
+          image: crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/yyc:host-debian
           command: ["sleep", "infinity"]
   links:
-    - uid: 100
-      peer_pod: r2
-      local_intf: r1_r2
-      peer_intf:  r2_r1
-      local_ip:   192.168.0.1/24
-      peer_ip:    192.168.0.2/24
+    - uid: 1
+      peer_pod: host2
+      local_intf: host1_host2
+      peer_intf:  host2_host1
+      local_ip:   10.1.0.1/24
+      peer_ip:    10.1.0.2/24
 
 ---
-# r2 强制调度到 node2
 apiVersion: vntopo.bupt.site/v1alpha1
 kind: VNode
 metadata:
-  name: r2
-  namespace: demo
+  name: host2
+  namespace: demo-x
 spec:
-  role: r
+  role: host
+  dataCenter: dc2
   nodeSelector:
-    kubernetes.io/hostname: aiops-k8s2   # ← 改成你集群中第二个 worker
+    kubernetes.io/hostname: k8s-large-1665988579   # worker B：跟 host1 不同节点
   template:
     metadata: {}
     spec:
       containers:
-        - name: net
-          image: nicolaka/netshoot:latest
+        - name: pod
+          image: crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/yyc:host-debian
           command: ["sleep", "infinity"]
   links:
-    - uid: 100
-      peer_pod: r1
-      local_intf: r2_r1
-      peer_intf:  r1_r2
-      local_ip:   192.168.0.2/24
-      peer_ip:    192.168.0.1/24
+    - uid: 1
+      peer_pod: host1
+      local_intf: host2_host1
+      peer_intf:  host1_host2
+      local_ip:   10.1.0.2/24
+      peer_ip:    10.1.0.1/24
