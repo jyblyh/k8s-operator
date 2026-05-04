@@ -192,12 +192,13 @@ func (h *SetupHandler) handleSameNodeVeth(
 	}
 
 	tmpSuffix := strconv.FormatInt(link.UID, 10)
-	if err := MakeVethPair(
+	created, err := MakeVethPair(
 		localNs, peerNs,
 		link.LocalIntf, link.PeerIntf,
 		link.LocalIP, link.PeerIP,
 		tmpSuffix,
-	); err != nil {
+	)
+	if err != nil {
 		st.State = vntopov1alpha1.LinkStateError
 		st.LastError = err.Error()
 		return st
@@ -208,8 +209,14 @@ func (h *SetupHandler) handleSameNodeVeth(
 	st.State = vntopov1alpha1.LinkStateEstablished
 	st.LastError = ""
 	st.EstablishedAt = &now
-	logger.Info("veth link established",
-		"local_intf", link.LocalIntf, "peer_intf", link.PeerIntf)
+	if created {
+		logger.Info("veth link established",
+			"local_intf", link.LocalIntf, "peer_intf", link.PeerIntf)
+	} else {
+		// 幂等命中：设备已经在了，没做任何改动。降级到 V(1) 避免日志噪音。
+		logger.V(1).Info("veth link already present (idempotent)",
+			"local_intf", link.LocalIntf, "peer_intf", link.PeerIntf)
+	}
 	return st
 }
 
@@ -264,7 +271,7 @@ func (h *SetupHandler) handleCrossNodeVxlan(
 
 	vni := common.ComputeVNI(peer.Namespace, link.UID)
 
-	if err := MakeVxlanLink(VxlanParams{
+	created, err := MakeVxlanLink(VxlanParams{
 		VNI:         vni,
 		Local:       h.Underlay.LocalIP,
 		Remote:      peerIPParsed,
@@ -274,7 +281,8 @@ func (h *SetupHandler) handleCrossNodeVxlan(
 		PodNsPath:   localNs,
 		IntfName:    link.LocalIntf,
 		CIDR:        link.LocalIP,
-	}); err != nil {
+	})
+	if err != nil {
 		st.State = vntopov1alpha1.LinkStateError
 		st.LastError = err.Error()
 		st.VNI = vni
@@ -288,7 +296,12 @@ func (h *SetupHandler) handleCrossNodeVxlan(
 	st.VNI = vni
 	st.UnderlayIP = peerIP
 	st.EstablishedAt = &now
-	logger.Info("vxlan link established",
-		"local_intf", link.LocalIntf, "vni", vni, "remote", peerIP)
+	if created {
+		logger.Info("vxlan link established",
+			"local_intf", link.LocalIntf, "vni", vni, "remote", peerIP)
+	} else {
+		logger.V(1).Info("vxlan link already present (idempotent)",
+			"local_intf", link.LocalIntf, "vni", vni, "remote", peerIP)
+	}
 	return st
 }

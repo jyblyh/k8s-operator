@@ -135,19 +135,26 @@ vntopo-operator/
 
 **M2：同节点 veth 数据平面** — ✓ 完成（host1↔host2 同节点 ping 通）
 
-**M3：跨节点 VXLAN 数据平面** — ✓ 代码完成，待集群验证
+**M3：跨节点 VXLAN 数据平面** — ✓ 完成（host1↔host2 跨节点 ping 通）
+
+**M4：真实多节点拓扑（host + router）** — ✓ 代码完成，待集群验证
 
 变更要点：
 
-- 跨节点 link 走 **P2P unicast VXLAN**：双方各起一个 vxlan 设备 push 进 pod ns
-- VNI 由 `ComputeVNI(namespace, uid)` **确定性**算出，无需 controller 集中分配（24-bit fnv32 哈希）
-- agent 启动时 **自动探测 underlay**：优先用 `--underlay-iface`，否则 `NODE_IP` 反查网卡，再次默认路由兜底
-- 对端节点 IP 通过 K8s Node API 拿 InternalIP，作为 vxlan remote
-- 每端 agent 只操作本节点 pod ns（VXLAN 是双向独立的，不需要进对端 ns）
-- 新增 **DriftScanner**：60s 周期扫描本节点所有 VNode 重新 enqueue，自愈外部破坏（如手动 `ip link del`）
-- `LinksConverged` Condition 现在 veth + vxlan 一视同仁，全部 Established 才置 True
+- agent reconciler 加自定义 `vnTopologyChanged` predicate：仅在 spec generation /
+  status.hostNode / status.hostIP 变化时触发，linkStatus / conditions 变化不触发，
+  避免反馈环
+- agent reconciler 加反向 watch：任意 VNode 的 hostNode/hostIP/spec 变化 → 把它的
+  peer 全部入队。专门解决"router 默认调度后 host 节点必须等 60s drift scan
+  才知道 router 落到哪"的滞后问题
+- `MakeVethPair` / `MakeVxlanLink` 返回 `(created bool, err)`，setup_handler 用它
+  决定日志级别——真新建打 Info，幂等命中打 V(1)，日志噪音明显下降
+- 新增示例 `examples/two-host-one-router.yaml`：host1 (worker A) ↔ r1 (默认调度)
+  ↔ host2 (worker B) 三跳拓扑，r1 用真实 firewall-v2 镜像 + ip_forward 转发
 
-**M4：webhook 校验 + e2e + Prometheus 指标** — 计划中
+**M5：主容器自动注入命令 + ConfigMap** — 计划中（让 controller 自动给 router/sw/dhcp/dns 等节点生成启动命令和挂载 ConfigMap，参考原项目 `microops-fe` 的逻辑）
+
+**M6：webhook 校验 + e2e + Prometheus 指标** — 计划中
 
 详见 [`docs/roadmap.md`](docs/roadmap.md)。
 
@@ -187,9 +194,39 @@ kubectl -n demo-x exec host1 -c pod -- ip -d link show host1_host2
 sudo tcpdump -ni eth0 'udp port 4789' -c 5
 ```
 
-## 验证 M2（保留作回归测试）
+## 验证 M4（host + router 三跳）
+
+```bash
+# agent 镜像变更（reconciler predicate / 反向 watch）
+make docker-build-agent docker-push-agent
+kubectl -n vntopo-system rollout restart daemonset vntopo-agent
+
+# 部署示例：host1 / host2 在不同 worker，r1 让 K8s 调度
+kubectl apply -f examples/two-host-one-router.yaml
+
+# 等三个 Pod Ready
+kubectl -n demo-r get pods -o wide
+
+# 验证三跳：host1 → r1 直连 → r1 → host2
+kubectl -n demo-r exec host1 -c pod -- ping -c 3 10.0.1.1   # host1 ↔ r1.eth1
+kubectl -n demo-r exec host1 -c pod -- ping -c 3 10.0.2.1   # host1 → r1 内转发到 r1.eth2
+kubectl -n demo-r exec host1 -c pod -- ping -c 3 10.0.2.10  # host1 → r1 → host2 三跳
+
+# 看路由器内部转发计数（每次 ping 计数会涨）
+kubectl -n demo-r exec r1 -c pod -- cat /proc/net/dev
+
+# 验证反向 watch 起作用（router status.hostNode 变 → host 立刻被 enqueue）
+kubectl -n vntopo-system logs -l app.kubernetes.io/component=agent --tail=200 \
+  | grep -E "vxlan link established|veth link established"
+# 期望看到 host1 / host2 / r1 三方在 r1 调度完成后几秒内全部 established
+```
+
+## 验证 M2 / M3（保留作回归测试）
 
 ```bash
 kubectl apply -f examples/single-host-veth.yaml
 kubectl -n demo exec host1 -c pod -- ping -c 3 10.0.0.2
+
+kubectl apply -f examples/cross-host-vxlan.yaml
+kubectl -n demo-x exec host1 -c pod -- ping -c 3 10.1.0.2
 ```

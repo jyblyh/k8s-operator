@@ -52,7 +52,13 @@ type VxlanParams struct {
 
 // MakeVxlanLink 在本节点创建一个 VXLAN 设备，push 到 pod netns 并配置 IP。
 //
-// 幂等：pod ns 内同名接口已存在则直接返回 nil（不校验参数是否匹配；
+// 返回值
+//
+//   - created==true  → 本次真正新建了 vxlan 设备
+//   - created==false → 幂等命中（pod ns 内同名接口已存在）
+//   - err != nil     → 建链失败
+//
+// 幂等：pod ns 内同名接口已存在则直接返回 (false, nil)（不校验参数是否匹配；
 // 后续重建链路通过 DeleteVxlanLink 显式拆除再调本函数）。
 //
 // 关键实现细节
@@ -69,18 +75,18 @@ type VxlanParams struct {
 //
 //   - vxlan 设备名我们用 "vx<vni>" + 临时后缀，最长 15 字符限制：
 //     "vxlan%d" 会到 11 位（"vxlan16777215"），16 位超长，所以用 "vx%d"。
-func MakeVxlanLink(p VxlanParams) error {
+func MakeVxlanLink(p VxlanParams) (created bool, err error) {
 	if p.VNI == 0 {
-		return fmt.Errorf("vni == 0")
+		return false, fmt.Errorf("vni == 0")
 	}
 	if p.Local == nil || p.Remote == nil {
-		return fmt.Errorf("local/remote ip empty")
+		return false, fmt.Errorf("local/remote ip empty")
 	}
 	if p.UnderlayIdx == 0 {
-		return fmt.Errorf("underlay ifindex == 0")
+		return false, fmt.Errorf("underlay ifindex == 0")
 	}
 	if p.PodNsPath == "" || p.IntfName == "" {
-		return fmt.Errorf("pod ns path / intf empty")
+		return false, fmt.Errorf("pod ns path / intf empty")
 	}
 
 	runtime.LockOSThread()
@@ -88,29 +94,29 @@ func MakeVxlanLink(p VxlanParams) error {
 
 	origNs, err := netns.Get()
 	if err != nil {
-		return fmt.Errorf("get current netns: %w", err)
+		return false, fmt.Errorf("get current netns: %w", err)
 	}
 	defer origNs.Close()
 	defer func() { _ = netns.Set(origNs) }()
 
 	podNs, err := netns.GetFromPath(p.PodNsPath)
 	if err != nil {
-		return fmt.Errorf("open pod netns %s: %w", p.PodNsPath, err)
+		return false, fmt.Errorf("open pod netns %s: %w", p.PodNsPath, err)
 	}
 	defer podNs.Close()
 
 	// 幂等：pod ns 内已有同名接口直接结束。
 	exists, err := linkExistsInNs(origNs, podNs, p.IntfName)
 	if err != nil {
-		return fmt.Errorf("check pod link: %w", err)
+		return false, fmt.Errorf("check pod link: %w", err)
 	}
 	if exists {
-		return nil
+		return false, nil
 	}
 
 	// 必须先回到 host ns 才能 LinkAdd vxlan 并附 underlay。
 	if err := netns.Set(origNs); err != nil {
-		return fmt.Errorf("setns(orig) before LinkAdd: %w", err)
+		return false, fmt.Errorf("setns(orig) before LinkAdd: %w", err)
 	}
 
 	// 临时名 vx<vni>，最长 15 字符——"vx16777215"=10 字符，安全。
@@ -146,28 +152,25 @@ func MakeVxlanLink(p VxlanParams) error {
 		Learning:     false, // 我们是 P2P，不需要内核学 fdb
 	}
 	if err := netlink.LinkAdd(vxlan); err != nil {
-		return fmt.Errorf("LinkAdd vxlan(vni=%d): %w", p.VNI, err)
+		return false, fmt.Errorf("LinkAdd vxlan(vni=%d): %w", p.VNI, err)
 	}
 
 	link, err := netlink.LinkByName(tmpName)
 	if err != nil {
 		_ = netlink.LinkDel(vxlan)
-		return fmt.Errorf("LinkByName %s after add: %w", tmpName, err)
+		return false, fmt.Errorf("LinkByName %s after add: %w", tmpName, err)
 	}
 
-	// push 到 pod ns
 	if err := netlink.LinkSetNsFd(link, int(podNs)); err != nil {
 		_ = netlink.LinkDel(link)
-		return fmt.Errorf("push vxlan -> pod ns: %w", err)
+		return false, fmt.Errorf("push vxlan -> pod ns: %w", err)
 	}
 
-	// 在 pod ns 内 rename + up + 配 IP（configureInNs 已经处理 EEXIST）
 	if err := configureInNs(origNs, podNs, tmpName, p.IntfName, p.CIDR); err != nil {
-		// 回滚：从 pod ns 把它删了
 		_ = deleteLinkInNs(origNs, podNs, tmpName)
-		return fmt.Errorf("configure vxlan in pod ns: %w", err)
+		return false, fmt.Errorf("configure vxlan in pod ns: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // DeleteVxlanLink 在 pod ns 内删除指定 vxlan 接口。

@@ -24,9 +24,15 @@ import (
 //   - tmpSuffix             ：用于在 host netns 创建 veth 时的临时名后缀，
 //     建议传 link.UID 字符串，确保同节点上多条 link 并发建链不会临时名相撞
 //
+// 返回值
+//
+//   - created==true  → 本次真正新建了 veth pair
+//   - created==false → 幂等命中（两端接口名已存在），未做任何改动
+//   - err != nil     → 建链失败
+//
 // 幂等性
 //
-//   - 如果两端目标接口名都已存在，函数直接返回 nil（不重复建）
+//   - 如果两端目标接口名都已存在，函数直接返回 (false, nil)
 //   - 如果只有一端存在（说明上次没建完），先清理掉残留再重建
 //
 // 实现要点
@@ -46,12 +52,12 @@ func MakeVethPair(
 	localIntf, peerIntf string,
 	localCIDR, peerCIDR string,
 	tmpSuffix string,
-) error {
+) (created bool, err error) {
 	if localNsPath == "" || peerNsPath == "" {
-		return fmt.Errorf("netns path empty")
+		return false, fmt.Errorf("netns path empty")
 	}
 	if localIntf == "" || peerIntf == "" {
-		return fmt.Errorf("interface name empty")
+		return false, fmt.Errorf("interface name empty")
 	}
 
 	// 锁住 OS thread——下面所有 SetNs 都依赖它。
@@ -60,50 +66,50 @@ func MakeVethPair(
 
 	origNs, err := netns.Get()
 	if err != nil {
-		return fmt.Errorf("get current netns: %w", err)
+		return false, fmt.Errorf("get current netns: %w", err)
 	}
 	defer origNs.Close()
 	defer func() { _ = netns.Set(origNs) }() // 函数退出前还原宿主 ns
 
 	nsLocal, err := netns.GetFromPath(localNsPath)
 	if err != nil {
-		return fmt.Errorf("open local netns %s: %w", localNsPath, err)
+		return false, fmt.Errorf("open local netns %s: %w", localNsPath, err)
 	}
 	defer nsLocal.Close()
 
 	nsPeer, err := netns.GetFromPath(peerNsPath)
 	if err != nil {
-		return fmt.Errorf("open peer netns %s: %w", peerNsPath, err)
+		return false, fmt.Errorf("open peer netns %s: %w", peerNsPath, err)
 	}
 	defer nsPeer.Close()
 
 	// 幂等检查
 	localExists, err := linkExistsInNs(origNs, nsLocal, localIntf)
 	if err != nil {
-		return fmt.Errorf("check local link: %w", err)
+		return false, fmt.Errorf("check local link: %w", err)
 	}
 	peerExists, err := linkExistsInNs(origNs, nsPeer, peerIntf)
 	if err != nil {
-		return fmt.Errorf("check peer link: %w", err)
+		return false, fmt.Errorf("check peer link: %w", err)
 	}
 	if localExists && peerExists {
-		return nil
+		return false, nil
 	}
 	// 单端残留 → 清理再建（更激进但更稳妥）
 	if localExists {
 		if err := deleteLinkInNs(origNs, nsLocal, localIntf); err != nil {
-			return fmt.Errorf("cleanup stale local link: %w", err)
+			return false, fmt.Errorf("cleanup stale local link: %w", err)
 		}
 	}
 	if peerExists {
 		if err := deleteLinkInNs(origNs, nsPeer, peerIntf); err != nil {
-			return fmt.Errorf("cleanup stale peer link: %w", err)
+			return false, fmt.Errorf("cleanup stale peer link: %w", err)
 		}
 	}
 
 	// 必须在宿主 ns 才能 LinkAdd 一对 veth 并控制其 ns 归属。
 	if err := netns.Set(origNs); err != nil {
-		return fmt.Errorf("setns(origNs) before LinkAdd: %w", err)
+		return false, fmt.Errorf("setns(origNs) before LinkAdd: %w", err)
 	}
 
 	// Linux 接口名最长 15 字符——临时名留好余量。
@@ -115,46 +121,44 @@ func MakeVethPair(
 		PeerName:  tmpB,
 	}
 	if err := netlink.LinkAdd(veth); err != nil {
-		return fmt.Errorf("LinkAdd veth pair: %w", err)
+		return false, fmt.Errorf("LinkAdd veth pair: %w", err)
 	}
 
 	// 拿两端 link 引用
 	linkA, err := netlink.LinkByName(tmpA)
 	if err != nil {
-		return fmt.Errorf("LinkByName %s: %w", tmpA, err)
+		return false, fmt.Errorf("LinkByName %s: %w", tmpA, err)
 	}
 	linkB, err := netlink.LinkByName(tmpB)
 	if err != nil {
 		_ = netlink.LinkDel(linkA) // 回滚
-		return fmt.Errorf("LinkByName %s: %w", tmpB, err)
+		return false, fmt.Errorf("LinkByName %s: %w", tmpB, err)
 	}
 
 	// push 到目标 netns
 	if err := netlink.LinkSetNsFd(linkA, int(nsLocal)); err != nil {
 		_ = netlink.LinkDel(linkA)
-		return fmt.Errorf("push %s -> local ns: %w", tmpA, err)
+		return false, fmt.Errorf("push %s -> local ns: %w", tmpA, err)
 	}
 	if err := netlink.LinkSetNsFd(linkB, int(nsPeer)); err != nil {
 		// linkA 已 push 走了，回滚得切到 nsLocal 删掉
 		_ = deleteLinkInNs(origNs, nsLocal, tmpA)
-		return fmt.Errorf("push %s -> peer ns: %w", tmpB, err)
+		return false, fmt.Errorf("push %s -> peer ns: %w", tmpB, err)
 	}
 
 	// 在两端 netns 内分别 rename + up + 配 IP
 	if err := configureInNs(origNs, nsLocal, tmpA, localIntf, localCIDR); err != nil {
-		// 出错时尽量回滚两端
 		_ = deleteLinkInNs(origNs, nsLocal, tmpA)
 		_ = deleteLinkInNs(origNs, nsPeer, tmpB)
-		return fmt.Errorf("configure local end: %w", err)
+		return false, fmt.Errorf("configure local end: %w", err)
 	}
 	if err := configureInNs(origNs, nsPeer, tmpB, peerIntf, peerCIDR); err != nil {
-		// local 端已配好，但 peer 失败，整对都删掉
 		_ = deleteLinkInNs(origNs, nsLocal, localIntf)
 		_ = deleteLinkInNs(origNs, nsPeer, tmpB)
-		return fmt.Errorf("configure peer end: %w", err)
+		return false, fmt.Errorf("configure peer end: %w", err)
 	}
 
-	return nil
+	return true, nil
 }
 
 // DeleteVethEnd 在指定 netns 内删掉单个接口。删一端，对端 veth 内核会自动删。

@@ -18,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -26,6 +27,41 @@ import (
 
 	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
 )
+
+// vnTopologyChanged 是一个自定义 predicate：
+//
+//   - spec generation 变 → 触发（设备增减、IP 修改、nodeSelector 修改）
+//   - status.hostNode 变 → 触发（pod 调度落点变了，跨节点 link 需要重算）
+//   - status.hostIP   变 → 触发（节点 IP 变了，VXLAN remote 需要更新）
+//   - 其他 status 变化（linkStatus / conditions / phase）→ **不触发**
+//
+// 为什么需要这个：默认的 GenerationChangedPredicate 只看 spec 的 generation；
+// 但 router 类节点 nodeSelector 为空、由 K8s 自由调度，**spec 不变**而它的
+// status.hostNode 是后写入的——peer 端如果只看 generation，永远看不到这个
+// 变化，必须等 60s drift scan 才能感知。
+//
+// 同时排除 linkStatus / conditions：agent 自己 patch 这些字段，如果让它们
+// 触发 reconcile 就会形成 patch → reconcile → enqueue → patch 的反馈环
+// （M2 时被打爆队列的那个 bug）。
+type vnTopologyChanged struct{ predicate.Funcs }
+
+func (vnTopologyChanged) Update(e event.UpdateEvent) bool {
+	o, ok1 := e.ObjectOld.(*vntopov1alpha1.VNode)
+	n, ok2 := e.ObjectNew.(*vntopov1alpha1.VNode)
+	if !ok1 || !ok2 {
+		return false
+	}
+	if o.Generation != n.Generation {
+		return true
+	}
+	if o.Status.HostNode != n.Status.HostNode {
+		return true
+	}
+	if o.Status.HostIP != n.Status.HostIP {
+		return true
+	}
+	return false
+}
 
 // Reconciler 在每个 worker 节点上跑，把本节点 Pod 相关的 VNode 事件转换成
 // SetupTask 推到 WorkerPool。真正建链由 SetupHandler 完成。
@@ -49,9 +85,12 @@ type Reconciler struct {
 	Predicate func(p *corev1.Pod) bool // 可选：测试用
 }
 
-// Reconcile 处理一次 VNode 变更：把变更对象自身 + 它的邻居全部入队。
+// Reconcile 处理一次 VNode 变更：只把变更对象自身入队。
 //
-// 入队的是 Pod-级任务，handler 自己读最新 spec，所以这里不需要传 link 详情。
+// 邻居（peer）入队由 Watches(VNode) + mapVNodePeerToSelf 路径自动完成；
+// 这里不再像早期版本那样手动 for-loop spec.links 入队对端，避免和反向
+// watch 路径重复——worker pool 的 sync.Map 去重虽然能兜住，但少一份
+// 冗余事件总是更干净。
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("node", r.NodeName)
 
@@ -70,20 +109,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		Namespace: vn.Namespace,
 		PodName:   vn.Name,
 	}); err != nil {
-		// queue 满 → 不阻塞 controller-runtime 队列，下次 reconcile 再试
 		logger.Error(err, "enqueue task failed; will retry on next reconcile")
 		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// 邻居：当前 vn 状态变化（比如刚被调度）会影响邻居 LinksConverged，
-	// 把同 namespace 内 spec.links.peer_pod 引用到 vn 的 VNode 也入队。
-	// 简化做法：只入队 vn.spec.links 的对端；对面如果也指向我，他自己 reconcile
-	// 会走对称路径。
-	for _, link := range vn.Spec.Links {
-		_ = r.Pool.Enqueue(SetupTask{
-			Namespace: vn.Namespace,
-			PodName:   link.PeerPod,
-		})
 	}
 
 	return ctrl.Result{}, nil
@@ -102,23 +129,30 @@ func (r *Reconciler) belongsToThisNode(vn *vntopov1alpha1.VNode) bool {
 	return false
 }
 
-// SetupWithManager 注册 watch。
+// SetupWithManager 注册 watch。三条路径同时跑：
 //
-// 关键：VNode watch 只在 **spec generation 变化** 时触发；status 变化不触发。
-// 这一条非常重要——agent 自己 patch status.linkStatus 也会引起 watch 事件，
-// 如果不过滤就会形成 patch → reconcile → enqueue → patch 的反馈环，导致
-// worker 队列被相同任务灌爆（出现过 cap=256 全部装满的 bug）。
+//  1. **For(VNode)**：自身 spec / hostNode / hostIP 变化 → reconcile 自身。
+//     用 vnTopologyChanged 屏蔽 linkStatus 反馈环。
 //
-// 真正建链需要重新触发的事件：
-//   - VNode spec 改动（Generation 变化）→ 由 GenerationChangedPredicate 放行
-//   - Pod 创建/重建（containerID 变化）→ 由 Pod watch + podOnThisNode 放行
+//  2. **Watches(VNode) + mapVNodePeerToSelf**：任意 VNode 的 hostNode/hostIP/spec
+//     变化 → 把它的 peer（spec.links 中引用了它的 VNode）入队。这一条专门
+//     解决"router 默认调度后 host 节点 agent 必须等 60s drift scan 才知道
+//     router 落到哪"的滞后问题——router status.hostNode 一旦写入，host
+//     节点的 reconciler 就会立刻把 host VNode 入队，agent 重新建跨节点 link。
+//
+//  3. **Watches(Pod)**：本节点 Pod 创建/重建 → reconcile 对应 VNode（用同名匹配）。
 //
 // 注意：controller-runtime v0.11.x 的 Watches 需要 source.Kind 包装；
 // MapFunc 不接收 ctx（v0.15+ 才加上）。
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vntopov1alpha1.VNode{},
-			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			builder.WithPredicates(vnTopologyChanged{}),
+		).
+		Watches(
+			&source.Kind{Type: &vntopov1alpha1.VNode{}},
+			handler.EnqueueRequestsFromMapFunc(r.mapVNodePeerToSelf),
+			builder.WithPredicates(vnTopologyChanged{}),
 		).
 		Watches(
 			&source.Kind{Type: &corev1.Pod{}},
@@ -135,4 +169,38 @@ func (r *Reconciler) mapPodToVNode(obj client.Object) []reconcile.Request {
 			NamespacedName: client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()},
 		},
 	}
+}
+
+// mapVNodePeerToSelf 反向映射：当某个 VNode "changed" 的 hostNode/hostIP/spec
+// 变化时，找出 namespace 内所有把 changed.Name 列为 peer 的 VNode，把它们入队。
+//
+// 实现走 informer cache（r.List），不会打到 apiserver；mapping 函数本身在
+// controller-runtime 的 watch 处理协程上跑，要避免阻塞——cache list 是 O(N)
+// 内存遍历，N 是本 namespace 内 VNode 数量，几十几百级别完全 OK。
+func (r *Reconciler) mapVNodePeerToSelf(obj client.Object) []reconcile.Request {
+	changed, ok := obj.(*vntopov1alpha1.VNode)
+	if !ok {
+		return nil
+	}
+	var list vntopov1alpha1.VNodeList
+	if err := r.List(context.Background(), &list, client.InNamespace(changed.Namespace)); err != nil {
+		return nil
+	}
+	var out []reconcile.Request
+	for i := range list.Items {
+		v := &list.Items[i]
+		if v.Name == changed.Name {
+			// 自身已经被 For 路径覆盖，不重复
+			continue
+		}
+		for _, l := range v.Spec.Links {
+			if l.PeerPod == changed.Name {
+				out = append(out, reconcile.Request{
+					NamespacedName: client.ObjectKey{Namespace: v.Namespace, Name: v.Name},
+				})
+				break
+			}
+		}
+	}
+	return out
 }
