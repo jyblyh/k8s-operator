@@ -184,6 +184,26 @@ func renderFrrConf(vn *vntopov1alpha1.VNode, rc *vntopov1alpha1.RouterConfig, en
 // buildRouterCommand 组装主容器启动 shell 脚本。
 //
 // 必须 echo ip_forward 而不是依赖 frr——zebra 默认不会改 ip_forward sysctl。
+//
+// 关于 PID 1 与 zombie reaper
+// ===========================
+//
+// 容器里 PID 1 = bash 的常见坑：
+//
+//  1. **bash tail-call exec optimization**：如果脚本最后一条命令是
+//     `sleep infinity`，bash 会用 exec(2) 把自己替换成 sleep，PID 1 就变成
+//     sleep。sleep 没有 SIGCHLD handler，frr daemon daemonize 后被 reparent
+//     来全部变 zombie，frrinit.sh restart 也会 hang（kill 不掉 zombie）。
+//     反推就是当前用户看到的现象。
+//
+//  2. **解法**：脚本结尾不是单条 sleep，而是 `bg_pid=$(...)& ; wait $bg_pid`：
+//     bash 会留在 wait 状态，bash 的 SIGCHLD handler 会主动 waitpid(-1, ...)
+//     reap 所有孤儿（包括被 reparent 来的 frr daemon）。这等于一个免费的
+//     PID-1 reaper，零依赖（不需要镜像里有 tini）。
+//
+//  3. **对 reload 的影响**：bash reap zombie 后，frrinit.sh restart 在 stop
+//     阶段能正常 kill -TERM 仍活着的 daemon、收掉它们的 exit code，start
+//     阶段重启。整个 reload 链路恢复 idempotent。
 func buildRouterCommand(vn *vntopov1alpha1.VNode, enableFrr bool) []string {
 	var b strings.Builder
 	b.WriteString("set -e\n")
@@ -223,8 +243,32 @@ func buildRouterCommand(vn *vntopov1alpha1.VNode, enableFrr bool) []string {
 
 	b.WriteString("echo '[router-init] router ready:'\n")
 	b.WriteString("ip a; ip route\n")
-	b.WriteString("sleep infinity\n")
+	// PID-1 reaper 模式：bash 留在 wait $BG_PID，期间 bash 的 SIGCHLD handler
+	// 自动 waitpid(-1) reap 孤儿。SIGTERM 时 trap 优雅退出。
+	b.WriteString(pid1ReaperTail())
 	return []string{"/bin/bash", "-c", b.String()}
+}
+
+// pid1ReaperTail 是一段通用的 bash 脚本尾段，让 bash 留在前台 wait 状态
+// 充当 PID 1 reaper。任何注入器拼出来的主容器命令都应该用它结尾。
+//
+// 关键点：
+//   - 不是单条 sleep（防止 bash tail-call exec 替换成 sleep 自己）
+//   - bash 在 wait $BG_PID 时收到任何 SIGCHLD 都会 waitpid(-1, ...)，
+//     免费 reap 所有被 reparent 来的孤儿
+//   - SIGTERM 触发 trap，kill 后台 sleep 并 exit，让 K8s graceful shutdown 工作
+func pid1ReaperTail() string {
+	return strings.Join([]string{
+		"echo '[init] entering pid-1 reaper loop'",
+		"sleep infinity &",
+		"BG_PID=$!",
+		// 收到 SIGTERM/INT：优雅停 frr 后退 0
+		"trap 'kill $BG_PID 2>/dev/null; /usr/lib/frr/frrinit.sh stop 2>/dev/null || true; exit 0' SIGTERM SIGINT",
+		// wait 在 SIGCHLD 时短暂返回，循环再 wait —— 真正阻塞的同时持续 reap
+		"while kill -0 $BG_PID 2>/dev/null; do",
+		"  wait $BG_PID 2>/dev/null || true",
+		"done",
+	}, "\n") + "\n"
 }
 
 // deriveRouterID 在用户没填 RouterID 时，从 spec.links[0].local_ip 截 host 部分。

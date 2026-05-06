@@ -100,9 +100,25 @@ func buildHostCommand(intfs []string, hc *vntopov1alpha1.HostConfig) []string {
 
 	b.WriteString("echo '[host-init] network ready:'\n")
 	b.WriteString("ip a; ip route\n")
-	b.WriteString("sleep infinity\n")
+	// PID-1 reaper 尾段，避免 bash 把自己 exec 替换成 sleep（详见 router.go）。
+	// host 没有 frr 要 stop，trap 逻辑更简单。
+	b.WriteString(hostPid1Tail())
 
 	return []string{"/bin/bash", "-c", b.String()}
+}
+
+// hostPid1Tail 是 host 容器尾段——和 router 的 reaper 模式一致，但不用
+// 停 frr。bash 阻塞在 wait $BG_PID，SIGCHLD 时自动 reap 孤儿。
+func hostPid1Tail() string {
+	return strings.Join([]string{
+		"echo '[host-init] entering pid-1 reaper loop'",
+		"sleep infinity &",
+		"BG_PID=$!",
+		"trap 'kill $BG_PID 2>/dev/null; exit 0' SIGTERM SIGINT",
+		"while kill -0 $BG_PID 2>/dev/null; do",
+		"  wait $BG_PID 2>/dev/null || true",
+		"done",
+	}, "\n") + "\n"
 }
 
 // shellQuote 极简 shell 字符串引用：把单引号转义。
