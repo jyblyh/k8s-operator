@@ -72,6 +72,34 @@ spec:
                   所属数据中心标识。同一 dataCenter 下的所有 VNode 必须共享同一个 nodeSelector
                   （由 webhook 强制校验）。role=r 作为 inter-DC 路由器时可留空。
                 type: string
+              extraConfigMaps:
+                description: |-
+                  ExtraConfigMaps 是用户附带的 ConfigMap，controller 创建并自动挂载到主容器。
+                  留给高级用户做 escape hatch（角色注入器无法覆盖时手动指定）。
+                items:
+                  description: |-
+                    ExtraConfigMap 描述一个用户附带的 ConfigMap 资源，controller 会以 OwnerReference
+                    形式 create/update 它，并自动挂载到主容器指定路径。
+                  properties:
+                    data:
+                      additionalProperties:
+                        type: string
+                      description: ConfigMap data：键 = 文件名，值 = 文件内容。
+                      type: object
+                    mountPath:
+                      description: 主容器挂载点，例如 "/etc/myapp"。
+                      type: string
+                    name:
+                      description: ConfigMap 名（同 namespace）。空时 controller 自动用 "{vnode-name}-extra-{idx}"。
+                      type: string
+                    readOnly:
+                      description: 是否只读（默认 false）。
+                      type: boolean
+                  required:
+                  - data
+                  - mountPath
+                  type: object
+                type: array
               links:
                 description: 本 VNode 对外的所有点对点链路。
                 items:
@@ -145,6 +173,15 @@ spec:
                 - dns
                 - ws
                 type: string
+              roleConfig:
+                description: |-
+                  RoleConfig 提供 role 特定的运行时参数（OSPF networks / DHCP 子网 / DNS zone 等）。
+                  controller 按 spec.role 选取对应子结构来渲染主容器命令和 ConfigMap data。
+
+
+                  Schemaless：不同 role 字段差别太大，把 schema 一一展开会让 CRD YAML 过百 KB；
+                  实际校验交给 controller 端 + webhook。
+                x-kubernetes-preserve-unknown-fields: true
               template:
                 description: |-
                   Pod 模板。controller 会在创建 Pod 时注入：
@@ -152,6 +189,9 @@ spec:
                     · nodeSelector / affinity（来自 spec.nodeSelector / spec.affinity）
                     · labels: vntopo.bupt.site/{role,dc,vnode}
                     · 一个 init container：vntopo-init
+                    · M4 起：按 spec.role 自动注入主容器 command / volumes / mounts /
+                      securityContext，以及关联的 ConfigMap（OSPF / OVS startup / dhcpd.conf 等）。
+                      如果用户在 template.containers[0].command 已自填，则尊重用户值不覆盖。
 
 
                   Schemaless 同上，避免展开 PodTemplateSpec 这棵超大 schema 树。
@@ -240,6 +280,12 @@ spec:
                   - type
                   type: object
                 type: array
+              configHash:
+                description: |-
+                  ConfigHash 是 controller 当前期望的 ConfigMap 内容指纹（hex sha256）。
+                  每次 controller 渲染并 ensureConfigMaps 后写入。agent 监听到它变化时
+                  会 docker exec 主容器执行 reload 命令。
+                type: string
               containerID:
                 description: sandbox 容器 ID，pod 重建后会变化，agent 据此判断是否要重建链路。
                 type: string
@@ -302,6 +348,36 @@ spec:
                 - Deleting
                 - Failed
                 type: string
+              serviceReload:
+                description: |-
+                  ServiceReload 描述本 VNode 主容器服务的最近一次 reload 状态（M4）。
+                  agent 收到 ConfigHash 变化后 exec 容器执行 role-specific reload 命令；
+                  这里反映那次执行的结果。
+                properties:
+                  command:
+                    description: 命令（仅展示用，便于 kubectl describe 排障）。
+                    items:
+                      type: string
+                    type: array
+                  lastTransitionTime:
+                    description: 完成时间。
+                    format: date-time
+                    type: string
+                  message:
+                    description: 失败时的错误信息（含 stderr 截断）。
+                    type: string
+                  observedHash:
+                    description: 这次 reload 对应的 ConfigHash（应当等于本 reload 完成时的 status.configHash）。
+                    type: string
+                  state:
+                    description: 状态。
+                    enum:
+                    - Pending
+                    - Success
+                    - Failed
+                    - NotApplicable
+                    type: string
+                type: object
               skipped:
                 items:
                   description: SkippedItem 沿用 meshnet 字段语义，记录因对端未就绪暂时跳过的链路。

@@ -1,56 +1,77 @@
 ---
-# vntopo-controller 需要的权限：管理 VNode + Pod + 读 Node + 发 Event。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: vntopo-controller-role
 rules:
-- apiGroups: [vntopo.bupt.site]
-  resources: [vnodes]
-  verbs: [get, list, watch, create, update, patch, delete]
-- apiGroups: [vntopo.bupt.site]
-  resources: [vnodes/status, vnodes/finalizers]
-  verbs: [get, update, patch]
-- apiGroups: [""]
-  resources: [pods]
-  verbs: [get, list, watch, create, update, patch, delete]
-- apiGroups: [""]
-  resources: [pods/status]
-  verbs: [get]
-- apiGroups: [""]
-  resources: [nodes]
-  verbs: [get, list, watch]
-- apiGroups: [""]
-  resources: [events]
-  verbs: [create, patch]
-# 下面两组是给 leader election 用的：
-#   · controller-runtime v0.11 默认锁是 "configmapsleases"（双写 ConfigMap + Lease）
-#   · 即使 --leader-elect=false，留着也无害，方便以后 HA 开启
-- apiGroups: [""]
-  resources: [configmaps]
-  verbs: [get, list, watch, create, update, patch, delete]
-- apiGroups: [coordination.k8s.io]
-  resources: [leases]
-  verbs: [get, list, watch, create, update, patch, delete]
----
-# vntopo-agent 只需要读 VNode/Pod/Node + patch VNode status。
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: vntopo-agent-role
-rules:
-- apiGroups: [vntopo.bupt.site]
-  resources: [vnodes]
-  verbs: [get, list, watch]
-- apiGroups: [vntopo.bupt.site]
-  resources: [vnodes/status]
-  verbs: [get, update, patch]
-- apiGroups: [""]
-  resources: [pods]
-  verbs: [get, list, watch]
-- apiGroups: [""]
-  resources: [nodes]
-  verbs: [get, list, watch]
-- apiGroups: [""]
-  resources: [events]
-  verbs: [create, patch]
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/status
+  verbs:
+  - get
+- apiGroups:
+  - vntopo.bupt.site
+  resources:
+  - vnodes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - vntopo.bupt.site
+  resources:
+  - vnodes/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - vntopo.bupt.site
+  resources:
+  - vnodes/status
+  verbs:
+  - get
+  - patch
+  - update
