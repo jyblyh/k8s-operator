@@ -55,6 +55,13 @@ type SetupHandler struct {
 
 	// NodeIP 用来解析对端 Node 的 InternalIP（vxlan remote）。
 	NodeIP *NodeIPResolver
+
+	// Docker 是给 ConfigMap reload 路径用的 docker.sock 客户端（M4）。
+	// 注入 docker exec 能力；nil 时 reload 直接降级为 NotApplicable。
+	//
+	// 同一个 client 不被 NetnsLookup 路径共享是设计选择：reload 期望长 ctx，
+	// netns 路径用快超时，httpc 配置不一样。runtime_docker.go 内部维护两份。
+	Docker *DockerClient
 }
 
 // Handle 是 worker pool 调用的入口。返回 error 让 worker 走重试逻辑。
@@ -95,6 +102,17 @@ func (h *SetupHandler) Handle(ctx context.Context, task SetupTask) error {
 	// 5) 写回 status.linkStatus
 	if err := h.patchLinkStatus(ctx, &vn, results); err != nil {
 		return fmt.Errorf("patch linkStatus: %w", err)
+	}
+
+	// 6) 如有需要做 ConfigMap 热 reload（M4）。
+	//
+	// 这里使用 patchLinkStatus 之后的 vn 副本——但 patchLinkStatus 内部会
+	// 重新拿 vn 自身的 status 修改后 patch，外层 vn 的 status 已是最新。
+	// reloadIfNeeded 会读 vn.Status.ConfigHash / ServiceReload 决定动作。
+	//
+	// 失败不阻塞 link setup 成功：reload 是独立动作，记到 status 即可。
+	if err := h.reloadIfNeeded(ctx, &vn); err != nil {
+		logger.V(1).Info("reload failed (non-fatal)", "err", err.Error())
 	}
 
 	logger.Info("setup pass complete",

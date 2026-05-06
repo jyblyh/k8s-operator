@@ -113,6 +113,9 @@ type VNodeSpec struct {
 	//   · nodeSelector / affinity（来自 spec.nodeSelector / spec.affinity）
 	//   · labels: vntopo.bupt.site/{role,dc,vnode}
 	//   · 一个 init container：vntopo-init
+	//   · M4 起：按 spec.role 自动注入主容器 command / volumes / mounts /
+	//     securityContext，以及关联的 ConfigMap（OSPF / OVS startup / dhcpd.conf 等）。
+	//     如果用户在 template.containers[0].command 已自填，则尊重用户值不覆盖。
 	//
 	// Schemaless 同上，避免展开 PodTemplateSpec 这棵超大 schema 树。
 	//
@@ -127,6 +130,179 @@ type VNodeSpec struct {
 	// 本 VNode 对外的所有点对点链路。
 	// +optional
 	Links []LinkSpec `json:"links,omitempty"`
+
+	// RoleConfig 提供 role 特定的运行时参数（OSPF networks / DHCP 子网 / DNS zone 等）。
+	// controller 按 spec.role 选取对应子结构来渲染主容器命令和 ConfigMap data。
+	//
+	// Schemaless：不同 role 字段差别太大，把 schema 一一展开会让 CRD YAML 过百 KB；
+	// 实际校验交给 controller 端 + webhook。
+	//
+	// +optional
+	// +kubebuilder:validation:Schemaless
+	// +kubebuilder:pruning:PreserveUnknownFields
+	RoleConfig *RoleConfig `json:"roleConfig,omitempty"`
+
+	// ExtraConfigMaps 是用户附带的 ConfigMap，controller 创建并自动挂载到主容器。
+	// 留给高级用户做 escape hatch（角色注入器无法覆盖时手动指定）。
+	// +optional
+	ExtraConfigMaps []ExtraConfigMap `json:"extraConfigMaps,omitempty"`
+}
+
+// ============================================================================
+//  RoleConfig：按 role 区分的运行时参数容器
+// ============================================================================
+
+// RoleConfig 是不同 role 的参数容器。每次只填一项，controller 根据 spec.role
+// 选取对应子结构；填错位置（比如 role=host 但只填了 RoleConfig.Router）controller
+// 会把 RoleConfig 当作未提供，走 role 默认值。
+type RoleConfig struct {
+	// +optional
+	Host *HostConfig `json:"host,omitempty"`
+	// +optional
+	Router *RouterConfig `json:"router,omitempty"`
+	// +optional
+	Switch *SwitchConfig `json:"switch,omitempty"`
+	// +optional
+	Firewall *FirewallConfig `json:"firewall,omitempty"`
+	// +optional
+	DHCP *DHCPConfig `json:"dhcp,omitempty"`
+	// +optional
+	DNS *DNSConfig `json:"dns,omitempty"`
+}
+
+// HostConfig 用于 role=host：默认网关、静态路由。
+type HostConfig struct {
+	// 默认网关 IP（不带掩码）。空时不设默认路由。
+	// +optional
+	DefaultGateway string `json:"defaultGateway,omitempty"`
+
+	// 静态路由（可选）。每条会被翻译成 `ip route replace <dest> via <via>`。
+	// +optional
+	StaticRoutes []StaticRoute `json:"staticRoutes,omitempty"`
+}
+
+// StaticRoute 一条静态路由。
+type StaticRoute struct {
+	Dest string `json:"dest"` // CIDR
+	Via  string `json:"via"`  // 下一跳 IP
+}
+
+// RouterConfig 用于 role=r：FRR / OSPF。
+type RouterConfig struct {
+	// OSPF 通告的网段（CIDR）。空切片时 controller 不启 OSPF，仅靠直连转发。
+	// +optional
+	OspfNetworks []string `json:"ospfNetworks,omitempty"`
+
+	// OSPF router-id（点分十进制）。空时由 controller 用 spec.links[0].local_ip 拼一个。
+	// +optional
+	RouterID string `json:"routerId,omitempty"`
+
+	// 是否启用 frr 进程。默认 true。把它设为 false 时 controller 只 echo ip_forward
+	// 不启 frr，适用于纯静态直连转发场景。
+	// +optional
+	EnableFrr *bool `json:"enableFrr,omitempty"`
+}
+
+// SwitchConfig 用于 role=sw / asw / csw：OVS 桥与 SVI。
+type SwitchConfig struct {
+	// 二层桥名，默认 "br0"。
+	// +optional
+	BridgeName string `json:"bridgeName,omitempty"`
+
+	// L3 switch（asw/csw）才用：在 br0 上创建 SVI 接口并配 IP。
+	// +optional
+	SVIs []SVI `json:"svis,omitempty"`
+}
+
+// SVI 在 OVS 桥上的虚拟三层接口。
+type SVI struct {
+	Name string `json:"name"` // 例如 "vlan10"
+	IP   string `json:"ip"`   // CIDR，例如 "10.0.10.1/24"
+	// +optional
+	VLAN int `json:"vlan,omitempty"`
+}
+
+// FirewallConfig 用于 role=fw：本质是 router + iptables。
+//
+// 不用 inline 嵌入 RouterConfig 是为了避开 controller-gen 对指针嵌入的 deepcopy
+// 生成 corner case；直接显式带 OspfNetworks/RouterID/EnableFrr 三个字段。
+type FirewallConfig struct {
+	// OSPF 通告的网段（CIDR）。空切片时不启 OSPF。
+	// +optional
+	OspfNetworks []string `json:"ospfNetworks,omitempty"`
+
+	// OSPF router-id。空时由 controller 自动派生。
+	// +optional
+	RouterID string `json:"routerId,omitempty"`
+
+	// 是否启用 frr 进程。默认 true。
+	// +optional
+	EnableFrr *bool `json:"enableFrr,omitempty"`
+
+	// 额外的 iptables 规则，启动时按顺序 `iptables` 执行。
+	// 例：`-A FORWARD -j ACCEPT`
+	// +optional
+	IptablesRules []string `json:"iptablesRules,omitempty"`
+}
+
+// DHCPConfig 用于 role=dhcp。
+type DHCPConfig struct {
+	// 监听的接口名（一般是 spec.links[0].local_intf）。
+	// +optional
+	Interface string `json:"interface,omitempty"`
+
+	// 一组要服务的子网。
+	Subnets []DHCPSubnet `json:"subnets,omitempty"`
+}
+
+// DHCPSubnet 一个 DHCP 子网定义。
+type DHCPSubnet struct {
+	Subnet     string   `json:"subnet"`           // CIDR，例如 "10.0.1.0/24"
+	RangeStart string   `json:"rangeStart"`       // 池起始 IP
+	RangeEnd   string   `json:"rangeEnd"`         // 池结束 IP
+	Router     string   `json:"router,omitempty"` // 下发给 client 的默认网关
+	DNS        []string `json:"dns,omitempty"`    // 下发给 client 的 DNS server
+	// +optional
+	LeaseSec int `json:"leaseSec,omitempty"`
+}
+
+// DNSConfig 用于 role=dns。
+type DNSConfig struct {
+	// +optional
+	Zones []DNSZone `json:"zones,omitempty"`
+}
+
+// DNSZone 一个 DNS zone。
+type DNSZone struct {
+	Domain  string      `json:"domain"`            // 例 "example.local"
+	Records []DNSRecord `json:"records,omitempty"` // A / NS / CNAME
+}
+
+// DNSRecord 一条 DNS 记录。
+type DNSRecord struct {
+	Name  string `json:"name"`            // host1
+	Type  string `json:"type"`            // A / CNAME / NS
+	Value string `json:"value"`           // 值
+	TTL   int    `json:"ttl,omitempty"`   // 默认 300
+	Class string `json:"class,omitempty"` // 默认 IN
+}
+
+// ExtraConfigMap 描述一个用户附带的 ConfigMap 资源，controller 会以 OwnerReference
+// 形式 create/update 它，并自动挂载到主容器指定路径。
+type ExtraConfigMap struct {
+	// ConfigMap 名（同 namespace）。空时 controller 自动用 "{vnode-name}-extra-{idx}"。
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// ConfigMap data：键 = 文件名，值 = 文件内容。
+	Data map[string]string `json:"data"`
+
+	// 主容器挂载点，例如 "/etc/myapp"。
+	MountPath string `json:"mountPath"`
+
+	// 是否只读（默认 false）。
+	// +optional
+	ReadOnly bool `json:"readOnly,omitempty"`
 }
 
 // ============================================================================
@@ -232,11 +408,50 @@ type VNodeStatus struct {
 	// +optional
 	LinkStatus []LinkStatus `json:"linkStatus,omitempty"`
 
+	// ConfigHash 是 controller 当前期望的 ConfigMap 内容指纹（hex sha256）。
+	// 每次 controller 渲染并 ensureConfigMaps 后写入。agent 监听到它变化时
+	// 会 docker exec 主容器执行 reload 命令。
+	// +optional
+	ConfigHash string `json:"configHash,omitempty"`
+
+	// ServiceReload 描述本 VNode 主容器服务的最近一次 reload 状态（M4）。
+	// agent 收到 ConfigHash 变化后 exec 容器执行 role-specific reload 命令；
+	// 这里反映那次执行的结果。
+	// +optional
+	ServiceReload *ServiceReloadStatus `json:"serviceReload,omitempty"`
+
 	// 标准 K8s conditions：LinksConverged / PodReady / Validated 等。
 	// +optional
 	// +patchMergeKey=type
 	// +patchStrategy=merge
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+}
+
+// ReloadState 描述 reload 命令执行的状态。
+// +kubebuilder:validation:Enum=Pending;Success;Failed;NotApplicable
+type ReloadState string
+
+const (
+	ReloadPending       ReloadState = "Pending"
+	ReloadSuccess       ReloadState = "Success"
+	ReloadFailed        ReloadState = "Failed"
+	ReloadNotApplicable ReloadState = "NotApplicable" // role 不需要 reload（如 host）
+)
+
+// ServiceReloadStatus 一次 reload 执行的快照。
+type ServiceReloadStatus struct {
+	// 这次 reload 对应的 ConfigHash（应当等于本 reload 完成时的 status.configHash）。
+	ObservedHash string `json:"observedHash,omitempty"`
+	// 状态。
+	State ReloadState `json:"state,omitempty"`
+	// 命令（仅展示用，便于 kubectl describe 排障）。
+	Command []string `json:"command,omitempty"`
+	// 失败时的错误信息（含 stderr 截断）。
+	// +optional
+	Message string `json:"message,omitempty"`
+	// 完成时间。
+	// +optional
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
 }
 
 // ============================================================================

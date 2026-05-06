@@ -12,6 +12,7 @@ import (
 
 	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
 	"github.com/jyblyh/k8s-operator/internal/common"
+	"github.com/jyblyh/k8s-operator/internal/roleinjector"
 )
 
 // renderPod 把 VNode.spec.template 渲染成最终下发到集群的 Pod。
@@ -23,7 +24,15 @@ import (
 //   - spec.nodeSelector / spec.affinity（来自 vn.spec）
 //   - spec.initContainers 追加 vntopo-init
 //   - 必要的 env / volumeMount 用于 init 容器联通本节点 agent socket
-func renderPod(vn *vntopov1alpha1.VNode, initImage string, scheme *runtime.Scheme) (*corev1.Pod, error) {
+//   - M4: 由 RoleInjector 产出的主容器命令、ConfigMap volumeMount、安全上下文等。
+//
+// inject 可以传 nil（向后兼容老调用方）；为 nil 时与 M3 行为完全一致。
+func renderPod(
+	vn *vntopov1alpha1.VNode,
+	initImage string,
+	scheme *runtime.Scheme,
+	inject *roleinjector.RoleInject,
+) (*corev1.Pod, error) {
 	tpl := vn.Spec.Template.DeepCopy()
 
 	pod := &corev1.Pod{
@@ -48,6 +57,16 @@ func renderPod(vn *vntopov1alpha1.VNode, initImage string, scheme *runtime.Schem
 	if vn.Spec.Affinity != nil {
 		pod.Spec.Affinity = vn.Spec.Affinity.DeepCopy()
 	}
+
+	// 应用 RoleInjector 的产出（如果有）：
+	//   - 注入主容器 command / volumeMounts / securityContext
+	//   - pod 级 volumes 追加
+	//   - extraConfigMaps（用户写的）也以 volume 形式挂入
+	//
+	// 用户优先级：tpl.Spec.Containers[0].Command 已经非空时，**不**覆盖 inject.Command；
+	// 这给高级用户保留 escape hatch（把 RoleInjector 当默认值用）。
+	applyRoleInject(pod, inject)
+	applyExtraConfigMaps(pod, vn)
 
 	// 注入 init 容器：拨本节点 agent 触发建链。
 	//
@@ -116,3 +135,94 @@ func mergeLabels(base, override map[string]string) map[string]string {
 }
 
 func ptrHostPathType(t corev1.HostPathType) *corev1.HostPathType { return &t }
+
+// applyRoleInject 把 inject 的产物落到 pod 上：
+//
+//   - inject.Command/Args  仅在主容器 (containers[0]) 没自填时才注入
+//   - inject.Env           追加到主容器 env
+//   - inject.Mounts        追加到主容器 volumeMounts
+//   - inject.Volumes       追加到 pod.spec.volumes
+//   - inject.Privileged    把主容器 SecurityContext.Privileged 设 true（如果还没设）
+//   - inject.Capabilities  追加到主容器 SecurityContext.Capabilities.Add
+//
+// 故意不动除主容器外的 sidecar，避免误伤用户多容器拓扑。
+func applyRoleInject(pod *corev1.Pod, inject *roleinjector.RoleInject) {
+	if inject == nil {
+		return
+	}
+	if len(pod.Spec.Containers) == 0 {
+		// 没有主容器（不太可能，CRD validation 会拦），保险起见 noop
+		return
+	}
+	main := &pod.Spec.Containers[0]
+
+	// command / args：用户已填则尊重
+	if len(main.Command) == 0 && len(inject.Command) > 0 {
+		main.Command = append([]string(nil), inject.Command...)
+	}
+	if len(main.Args) == 0 && len(inject.Args) > 0 {
+		main.Args = append([]string(nil), inject.Args...)
+	}
+
+	// env / mounts / volumes：追加（同名先到先得，与原项目 ConfigMap volume 名约定不冲突）
+	main.Env = append(main.Env, inject.Env...)
+	main.VolumeMounts = append(main.VolumeMounts, inject.Mounts...)
+	pod.Spec.Volumes = append(pod.Spec.Volumes, inject.Volumes...)
+
+	// SecurityContext：用户已显式开 privileged 或自配 capability 时，不覆盖；
+	// 否则按 inject 要求填。
+	if inject.Privileged || len(inject.Capabilities) > 0 {
+		if main.SecurityContext == nil {
+			main.SecurityContext = &corev1.SecurityContext{}
+		}
+		if inject.Privileged {
+			if main.SecurityContext.Privileged == nil {
+				t := true
+				main.SecurityContext.Privileged = &t
+			}
+		}
+		if len(inject.Capabilities) > 0 {
+			if main.SecurityContext.Capabilities == nil {
+				main.SecurityContext.Capabilities = &corev1.Capabilities{}
+			}
+			main.SecurityContext.Capabilities.Add = append(
+				main.SecurityContext.Capabilities.Add, inject.Capabilities...)
+		}
+	}
+}
+
+// applyExtraConfigMaps 把用户在 spec.extraConfigMaps 里声明的 ConfigMap
+// 以 volume 形式挂载到主容器。volume 名用 "extra-cm-{idx}"，避免和
+// RoleInjector 自动生成的 volume 冲突。
+//
+// 注意：ConfigMap 资源本身的 create/update 在 controller 的 ensureConfigMaps 里做；
+// 这里只负责"挂"。
+func applyExtraConfigMaps(pod *corev1.Pod, vn *vntopov1alpha1.VNode) {
+	if vn == nil || len(vn.Spec.ExtraConfigMaps) == 0 || len(pod.Spec.Containers) == 0 {
+		return
+	}
+	main := &pod.Spec.Containers[0]
+	for i, ecm := range vn.Spec.ExtraConfigMaps {
+		if ecm.MountPath == "" {
+			continue
+		}
+		cmName := ecm.Name
+		if cmName == "" {
+			cmName = defaultExtraCMName(vn.Name, i)
+		}
+		volName := defaultExtraCMVolumeName(i)
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: volName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: cmName},
+				},
+			},
+		})
+		main.VolumeMounts = append(main.VolumeMounts, corev1.VolumeMount{
+			Name:      volName,
+			MountPath: ecm.MountPath,
+			ReadOnly:  ecm.ReadOnly,
+		})
+	}
+}

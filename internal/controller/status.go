@@ -17,6 +17,7 @@ import (
 
 	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
 	"github.com/jyblyh/k8s-operator/internal/common"
+	"github.com/jyblyh/k8s-operator/internal/roleinjector"
 )
 
 // =============================================================================
@@ -90,7 +91,7 @@ func (r *VNodeReconciler) validateSpec(vn *vntopov1alpha1.VNode) error {
 // Pod 的渲染逻辑见 pod_renderer.go。这里不做 update —— Pod 模板对存量 Pod 不可变，
 // spec 修改只对未来重建的 Pod 生效。漂移检测交给 syncStatus 处理。
 func (r *VNodeReconciler) ensurePod(
-	ctx context.Context, vn *vntopov1alpha1.VNode,
+	ctx context.Context, vn *vntopov1alpha1.VNode, inject *roleinjector.RoleInject,
 ) (*corev1.Pod, error) {
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: vn.Namespace, Name: vn.Name}, pod)
@@ -105,7 +106,7 @@ func (r *VNodeReconciler) ensurePod(
 		return nil, err
 	}
 
-	rendered, err := renderPod(vn, r.InitImage, r.Scheme)
+	rendered, err := renderPod(vn, r.InitImage, r.Scheme, inject)
 	if err != nil {
 		return nil, fmt.Errorf("renderPod: %w", err)
 	}
@@ -137,9 +138,12 @@ func isOwnedByVNode(pod *corev1.Pod, vn *vntopov1alpha1.VNode) bool {
 // 漂移检测：sandbox containerID 变化（pod 被重建） → 把所有 linkStatus.state 设为 Pending，
 // 让 agent 在下次 reconcile 重建链路。M2 / M3 中 agent 会真正消费这个信号。
 //
+// configHash：M4 引入。控制器渲染并 ensure ConfigMaps 后写入，agent 监听
+// 到它和 status.serviceReload.observedHash 不一致时执行 reload 命令。
+//
 // 写回方式：与 base 做语义比较，无变化时跳过 API 调用，避免无谓写放大。
 func (r *VNodeReconciler) syncStatus(
-	ctx context.Context, vn *vntopov1alpha1.VNode, pod *corev1.Pod,
+	ctx context.Context, vn *vntopov1alpha1.VNode, pod *corev1.Pod, configHash string,
 ) error {
 	base := vn.DeepCopy()
 
@@ -147,6 +151,7 @@ func (r *VNodeReconciler) syncStatus(
 	vn.Status.HostIP = pod.Status.HostIP
 	vn.Status.HostNode = pod.Spec.NodeName
 	vn.Status.SrcIP = pod.Status.PodIP
+	vn.Status.ConfigHash = configHash
 
 	// 漂移检测：取第一个非 init 容器的 ID（足够唯一标识当前 sandbox 实例）。
 	if newCID := primaryContainerID(pod); newCID != "" && newCID != vn.Status.ContainerID {

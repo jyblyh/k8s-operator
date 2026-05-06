@@ -137,24 +137,82 @@ vntopo-operator/
 
 **M3：跨节点 VXLAN 数据平面** — ✓ 完成（host1↔host2 跨节点 ping 通）
 
-**M4：真实多节点拓扑（host + router）** — ✓ 代码完成，待集群验证
+**M3.5：真实多节点拓扑（host + router）** — ✓ 完成
 
 变更要点：
 
 - agent reconciler 加自定义 `vnTopologyChanged` predicate：仅在 spec generation /
-  status.hostNode / status.hostIP 变化时触发，linkStatus / conditions 变化不触发，
-  避免反馈环
+  status.hostNode / status.hostIP / status.configHash 变化时触发，linkStatus /
+  conditions / serviceReload 变化不触发，避免反馈环
 - agent reconciler 加反向 watch：任意 VNode 的 hostNode/hostIP/spec 变化 → 把它的
   peer 全部入队。专门解决"router 默认调度后 host 节点必须等 60s drift scan
   才知道 router 落到哪"的滞后问题
 - `MakeVethPair` / `MakeVxlanLink` 返回 `(created bool, err)`，setup_handler 用它
   决定日志级别——真新建打 Info，幂等命中打 V(1)，日志噪音明显下降
-- 新增示例 `examples/two-host-one-router.yaml`：host1 (worker A) ↔ r1 (默认调度)
-  ↔ host2 (worker B) 三跳拓扑，r1 用真实 firewall-v2 镜像 + ip_forward 转发
 
-**M5：主容器自动注入命令 + ConfigMap** — 计划中（让 controller 自动给 router/sw/dhcp/dns 等节点生成启动命令和挂载 ConfigMap，参考原项目 `microops-fe` 的逻辑）
+**M4：controller 自动注入主容器命令 + ConfigMap 热 reload** — ✓ 代码完成，待集群验证
 
-**M6：webhook 校验 + e2e + Prometheus 指标** — 计划中
+目标：让用户在 `VNode` 里只填 `roleConfig.{host,router,...}` 这种业务化字段，
+controller 自动渲染主容器命令（启 frr / 等接口 / 设默认网关）和 ConfigMap
+（frr.conf / daemons / vtysh.conf）；用户改 `ospfNetworks` 等参数时不需要重建
+Pod，agent 通过 `docker exec` 自动 reload 服务。
+
+新增 CRD 字段：
+
+| 字段 | 用途 |
+| --- | --- |
+| `spec.roleConfig.host`     | 默认网关 + 静态路由（role=host） |
+| `spec.roleConfig.router`   | OSPF networks / router-id（role=r） |
+| `spec.roleConfig.switch`   | OVS 桥名 + SVI（role=sw/asw/csw，占位） |
+| `spec.roleConfig.firewall` | router + iptables 规则（占位） |
+| `spec.roleConfig.dhcp`     | DHCP 子网池（占位） |
+| `spec.roleConfig.dns`      | DNS zone（占位） |
+| `spec.extraConfigMaps`     | 用户自带 ConfigMap 自动 mount（escape hatch） |
+| `status.configHash`        | controller 渲染的 ConfigMap 聚合 hash（sha256） |
+| `status.serviceReload`     | agent reload 执行结果 |
+
+新增组件：
+
+- `internal/roleinjector/`：role-specific pure-function 注入器，每个 role 一个文件
+  （host.go / router.go），controller 和 agent 都共用这个包
+- `internal/controller/configmap.go`：ensure ConfigMap + 算 hash + 写
+  `status.configHash`
+- `internal/agent/runtime_docker.go::DockerClient.Exec`：通过 docker.sock
+  实现 `docker exec`（plain HTTP + multiplex stream demux，零外部 SDK 依赖）
+- `internal/agent/reload_handler.go`：agent 在 link 建好后比对
+  `status.configHash` 与 `status.serviceReload.observedHash`，不一致就调
+  `RoleInjector.ReloadCommand`（router 是 `frrinit.sh restart`）
+
+写法对比 — 详见 `examples/two-host-one-router.yaml`：
+
+```yaml
+# M3 写法（旧，> 80 行）
+spec:
+  template:
+    spec:
+      containers:
+      - name: pod
+        securityContext: { privileged: true }
+        command: [ /bin/bash, -c, "echo 1 > ip_forward; for i in seq 1 60; do ..." ]
+```
+
+```yaml
+# M4 写法（新，< 20 行）
+spec:
+  template:
+    spec:
+      containers:
+      - name: pod
+        image: ...frr-image...
+  roleConfig:
+    router:
+      ospfNetworks: [10.0.1.0/24, 10.0.2.0/24]
+```
+
+**M5：sw/asw/csw + agent add-port** — 计划中（agent 通过 `docker exec ovs-vsctl add-port`
+让交换机的接口绑定也走自动化路径）
+
+**M6：dhcp / dns / fw / ws + webhook 校验 + e2e + Prometheus 指标** — 计划中
 
 详见 [`docs/roadmap.md`](docs/roadmap.md)。
 
@@ -194,31 +252,65 @@ kubectl -n demo-x exec host1 -c pod -- ip -d link show host1_host2
 sudo tcpdump -ni eth0 'udp port 4789' -c 5
 ```
 
-## 验证 M4（host + router 三跳）
+## 验证 M4（roleConfig 自动注入 + ConfigMap reload）
 
 ```bash
-# agent 镜像变更（reconciler predicate / 反向 watch）
-make docker-build-agent docker-push-agent
-kubectl -n vntopo-system rollout restart daemonset vntopo-agent
+# 1. 重新生成 deepcopy 和 CRD（CRD 字段加了 RoleConfig / ConfigHash / ServiceReload）
+make generate
+make manifests
 
-# 部署示例：host1 / host2 在不同 worker，r1 让 K8s 调度
+# 2. controller + agent 镜像都变了，重打推送
+make docker-build-controller docker-push-controller
+make docker-build-agent      docker-push-agent
+
+# 3. 重新部署
+make deploy
+kubectl -n vntopo-system rollout restart deployment vntopo-controller-manager
+kubectl -n vntopo-system rollout restart daemonset  vntopo-agent
+
+# 4. 部署 M4 写法示例（注意 nodeSelector 改成你集群里实际两个 worker 名）
 kubectl apply -f examples/two-host-one-router.yaml
 
-# 等三个 Pod Ready
+# 5. 三跳验证
 kubectl -n demo-r get pods -o wide
-
-# 验证三跳：host1 → r1 直连 → r1 → host2
 kubectl -n demo-r exec host1 -c pod -- ping -c 3 10.0.1.1   # host1 ↔ r1.eth1
-kubectl -n demo-r exec host1 -c pod -- ping -c 3 10.0.2.1   # host1 → r1 内转发到 r1.eth2
+kubectl -n demo-r exec host1 -c pod -- ping -c 3 10.0.2.1   # host1 → r1 转发到 r1.eth2
 kubectl -n demo-r exec host1 -c pod -- ping -c 3 10.0.2.10  # host1 → r1 → host2 三跳
 
-# 看路由器内部转发计数（每次 ping 计数会涨）
-kubectl -n demo-r exec r1 -c pod -- cat /proc/net/dev
+# 6. 看 controller 自动渲染的 ConfigMap
+kubectl -n demo-r get cm
+kubectl -n demo-r get cm r1-frr -o yaml | head -40
+# 期望看到 daemons / frr.conf / vtysh.conf 三个 key
 
-# 验证反向 watch 起作用（router status.hostNode 变 → host 立刻被 enqueue）
+# 7. 看 status.configHash + status.serviceReload
+kubectl -n demo-r get vn r1 -o yaml | grep -A2 -E "configHash|serviceReload"
+# 期望：
+#   configHash: <64-char hex>
+#   serviceReload:
+#     observedHash: <同上>
+#     state: Success
+#     command: [/bin/sh, -c, /usr/lib/frr/frrinit.sh restart]
+
+# 8. 看 host 的 reload 状态（host 没有 reload 命令）
+kubectl -n demo-r get vn host1 -o yaml | grep -A2 serviceReload
+# 期望：state: NotApplicable
+
+# 9. 验证 OSPF 真的跑起来了
+kubectl -n demo-r exec r1 -c pod -- vtysh -c 'show ip ospf neighbor'
+kubectl -n demo-r exec r1 -c pod -- vtysh -c 'show ip route ospf'
+
+# 10. 热 reload 验证：改 ospfNetworks 后 controller 应自动 reload，不重建 Pod
+kubectl -n demo-r patch vn r1 --type=merge -p '
+  {"spec":{"roleConfig":{"router":{"ospfNetworks":["10.0.1.0/24","10.0.2.0/24","10.0.99.0/24"]}}}}
+'
+# 几秒后看：
+kubectl -n demo-r get vn r1 -o yaml | grep -A2 -E "configHash|serviceReload"
+# configHash 应已更新；serviceReload.observedHash 跟上新值；state=Success
+kubectl -n demo-r get pod r1 -o wide
+# RESTARTS 列不变（Pod 没重建）
 kubectl -n vntopo-system logs -l app.kubernetes.io/component=agent --tail=200 \
-  | grep -E "vxlan link established|veth link established"
-# 期望看到 host1 / host2 / r1 三方在 r1 调度完成后几秒内全部 established
+  | grep -E "reload: docker exec|reload: exec ok"
+# 期望看到 agent 真正调用了 docker exec frrinit.sh restart
 ```
 
 ## 验证 M2 / M3（保留作回归测试）

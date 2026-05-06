@@ -115,6 +115,7 @@ func main() {
 		Locks:    agent.NewLinkLocks(),
 		Underlay: underlay,
 		NodeIP:   nodeIPResolver,
+		Docker:   dockerCli, // M4: docker exec 用，做 ConfigMap reload
 	}
 
 	// ---- worker pool：RPC server / reconciler / drift scan 共享同一个池

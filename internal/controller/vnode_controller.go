@@ -36,6 +36,7 @@ import (
 
 	vntopov1alpha1 "github.com/jyblyh/k8s-operator/api/v1alpha1"
 	"github.com/jyblyh/k8s-operator/internal/common"
+	"github.com/jyblyh/k8s-operator/internal/roleinjector"
 )
 
 // VNodeReconciler reconciles a VNode object.
@@ -54,6 +55,7 @@ type VNodeReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=pods/status,verbs=get
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile 是主控制循环。
 //
@@ -88,8 +90,29 @@ func (r *VNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 	r.recordValidationSuccess(&vn)
 
-	// ---------- 4. ensure Pod ----------
-	pod, err := r.ensurePod(ctx, &vn)
+	// ---------- 4a. role injection（M4） ----------
+	//
+	// 先做 RoleInjector：它是 pure function，不调 K8s API，可以提前算出来；
+	// ensurePod 需要这份 inject 来注入主容器命令。
+	inject, err := roleinjector.For(vn.Spec.Role).Inject(&vn)
+	if err != nil {
+		logger.Info("role inject failed", "err", err.Error())
+		return r.recordValidationFailure(ctx, &vn, err)
+	}
+
+	// ---------- 4b. ensure ConfigMaps（M4） ----------
+	//
+	// 把 RoleInjector 输出的 ConfigMap + 用户的 ExtraConfigMaps 合并 ensure，
+	// 拿到聚合 hash。Pod 不存在时也要先做这步，因为 Pod 启动后会立即挂载 ConfigMap。
+	allCMs := append([]corev1.ConfigMap{}, inject.ConfigMaps...)
+	allCMs = append(allCMs, desiredExtraConfigMaps(&vn)...)
+	configHash, err := ensureConfigMaps(ctx, r.Client, r.Scheme, &vn, allCMs)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// ---------- 4c. ensure Pod ----------
+	pod, err := r.ensurePod(ctx, &vn, inject)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -99,7 +122,7 @@ func (r *VNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	// ---------- 5/7. 漂移 + 同步 status ----------
-	if err := r.syncStatus(ctx, &vn, pod); err != nil {
+	if err := r.syncStatus(ctx, &vn, pod, configHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -174,6 +197,8 @@ func (r *VNodeReconciler) recordValidationSuccess(vn *vntopov1alpha1.VNode) {
 // Watch 的对象：
 //   - VNode 自身（主对象）
 //   - 由 VNode 拥有的 Pod（owns 关系，Pod 事件触发对应 VNode reconcile）
+//   - 由 VNode 拥有的 ConfigMap（M4：用户手动改/删 ConfigMap 时 controller 立刻
+//     enforce 期望状态；controller 自己 update CM 时新增的 reconcile 是 noop）
 //   - 邻居 VNode 的变更也要通过 EnqueueRequestsFromMapFunc 反向触发（M3 实现）。
 //
 // 注：controller-runtime v0.11.x 的 Watches 需要 source.Kind 包装；
@@ -182,6 +207,7 @@ func (r *VNodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vntopov1alpha1.VNode{}, builder.WithPredicates()).
 		Owns(&corev1.Pod{}).
+		Owns(&corev1.ConfigMap{}).
 		Watches(
 			&source.Kind{Type: &vntopov1alpha1.VNode{}},
 			handler.EnqueueRequestsFromMapFunc(r.mapPeerToReconcile),

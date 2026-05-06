@@ -33,16 +33,19 @@ import (
 //   - spec generation 变 → 触发（设备增减、IP 修改、nodeSelector 修改）
 //   - status.hostNode 变 → 触发（pod 调度落点变了，跨节点 link 需要重算）
 //   - status.hostIP   变 → 触发（节点 IP 变了，VXLAN remote 需要更新）
-//   - 其他 status 变化（linkStatus / conditions / phase）→ **不触发**
+//   - status.configHash 变 → 触发（M4：controller 渲染了新的 ConfigMap，agent 该 reload）
+//   - 其他 status 变化（linkStatus / conditions / phase / serviceReload）→ **不触发**
 //
 // 为什么需要这个：默认的 GenerationChangedPredicate 只看 spec 的 generation；
 // 但 router 类节点 nodeSelector 为空、由 K8s 自由调度，**spec 不变**而它的
 // status.hostNode 是后写入的——peer 端如果只看 generation，永远看不到这个
 // 变化，必须等 60s drift scan 才能感知。
 //
-// 同时排除 linkStatus / conditions：agent 自己 patch 这些字段，如果让它们
-// 触发 reconcile 就会形成 patch → reconcile → enqueue → patch 的反馈环
-// （M2 时被打爆队列的那个 bug）。
+// 同时排除 linkStatus / conditions / serviceReload：agent 自己 patch 这些字段，
+// 如果让它们触发 reconcile 就会形成 patch → reconcile → enqueue → patch 的
+// 反馈环（M2 时被打爆队列的那个 bug）。
+//
+// configHash 是 controller 写的，agent 只读不写，没有反馈环顾虑。
 type vnTopologyChanged struct{ predicate.Funcs }
 
 func (vnTopologyChanged) Update(e event.UpdateEvent) bool {
@@ -58,6 +61,9 @@ func (vnTopologyChanged) Update(e event.UpdateEvent) bool {
 		return true
 	}
 	if o.Status.HostIP != n.Status.HostIP {
+		return true
+	}
+	if o.Status.ConfigHash != n.Status.ConfigHash {
 		return true
 	}
 	return false

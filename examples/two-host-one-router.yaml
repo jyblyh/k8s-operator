@@ -1,4 +1,4 @@
-# 示例：两个 host 通过一个路由器互连
+# 示例：两个 host 通过一个路由器互连（M4 新写法：roleConfig 自动注入）
 #
 # 拓扑
 # ====
@@ -22,33 +22,58 @@
 #                │ r1 (调度由 K8s 自由决定)                │
 #                │   r1_host1: 10.0.1.1/24                 │
 #                │   r1_host2: 10.0.2.1/24                 │
-#                │   ip_forward = 1                        │
-#                │   通过两个直连子网做三层转发            │
+#                │   ip_forward = 1 + frr OSPF             │
 #                └─────────────────────────────────────────┘
+#
+# M3 vs M4 写法对比
+# =================
+#
+# M3 写法（M3.5 example）：
+#   spec:
+#     template:
+#       spec:
+#         containers:
+#         - name: pod
+#           securityContext: { privileged: true }
+#           command: [/bin/bash, -c, "echo 1 > ...; for i in seq 1 60; do ...]
+#
+#   缺点：每个 VNode 都要重复写一遍 wait-for-link / ip route / ip_forward 模板。
+#         拓扑大了写错一个字符 debug 半天。
+#
+# M4 写法（本文件）：
+#   spec:
+#     template:
+#       spec:
+#         containers:
+#         - name: pod        # 镜像必填
+#           image: ...
+#           # command/securityContext/挂载/ConfigMap 全部由 controller 注入
+#     roleConfig:
+#       host:                # role=host 时填这里，控制器渲染默认网关 + 静态路由
+#         defaultGateway: 10.0.1.1
+#       router:              # role=r  时填这里，控制器渲染 frr.conf + ospf
+#         ospfNetworks: [10.0.1.0/24, 10.0.2.0/24]
+#
+#   收益：
+#   1) 写法极简，关注业务（IP/网段），不关注脚本（ip route）
+#   2) ConfigMap reload：以后改 ospfNetworks，controller 重渲染 ConfigMap，
+#      agent docker exec frrinit.sh restart 自动 reload，不用重建 Pod
 #
 # 验证目标
 # ========
-#  · 三个 Pod 都 Running
-#  · host1 ping r1.eth1 (10.0.1.1) 通  → host1 ↔ r1 link 建好
-#  · host1 ping r1.eth2 (10.0.2.1) 通  → r1 转发能力 OK（同 r1 内不同接口）
-#  · host1 ping host2 (10.0.2.10) 通    → 三跳全通
-#
-# 关键设计点
-# ==========
-#  1. host1 / host2 在不同 worker 节点上 → host↔r1 必走 vxlan
-#     (host 节点 ↔ r1 调度到的节点 哪怕同节点也是 veth；不同节点是 vxlan)
-#
-#  2. r1 不设 nodeSelector → K8s 默认调度，可能落到任意节点
-#
-#  3. r1 status.hostNode 写入后，agent 反向 watch 会立刻把 host1 / host2
-#     重新入队建立跨节点 link，无需等 60s drift scan
-#
-#  4. r1 容器命令简单：开 ip_forward 后 sleep。
-#     **本轮没用 frr/OSPF**：两段直连子网够 r1 自动转发了。
-#     后续 M5 做"controller 自动注入 frr ConfigMap + 启动命令"时再演示完整 frr。
-#
-#  5. host 容器需要等 init 容器把 host1_r1 / host2_r1 接口建好后，
-#     再 ip route 配默认路由——所以 command 里有 while loop 等接口出现。
+#  · 三个 Pod 都 Running、status.phase=Ready
+#  · host1 ping r1.eth1 (10.0.1.1) 通  → host1 ↔ r1 link 建好（cross-node vxlan）
+#  · host1 ping r1.eth2 (10.0.2.1) 通  → r1 转发能力 OK
+#  · host1 ping host2 (10.0.2.10) 通    → 三跳全通（host1 ↔ r1 ↔ host2）
+#  · 三个 VNode 的 status.configHash / status.serviceReload 都显示出来：
+#      - host1 / host2: serviceReload.state = NotApplicable
+#      - r1: serviceReload.state = Success（OSPF reload 成功）
+#  · 改 r1.spec.roleConfig.router.ospfNetworks（添加新网段）后：
+#      - controller 更新 frr ConfigMap
+#      - r1.status.configHash 变化
+#      - agent 检测到 hash 变化 → docker exec frrinit.sh restart
+#      - r1.status.serviceReload.observedHash 跟上新值
+#      - 全程不重建 Pod
 
 ---
 apiVersion: v1
@@ -73,23 +98,10 @@ spec:
       containers:
         - name: pod
           image: crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/yyc:host-debian
-          # privileged 是为了让容器内能 ip route add；正式环境用 NET_ADMIN cap 即可
-          securityContext:
-            privileged: true
-          command:
-            - /bin/bash
-            - -c
-            - |
-              # 等 init 容器把 host1_r1 接口建好（agent 异步建链，可能晚 1-2s）
-              echo "waiting for host1_r1 to be created by vntopo-agent..."
-              for i in $(seq 1 60); do
-                if ip link show host1_r1 >/dev/null 2>&1; then break; fi
-                sleep 1
-              done
-              ip route replace default via 10.0.1.1 dev host1_r1 || true
-              echo "default route set, host1 ready"
-              ip a; ip route
-              sleep infinity
+          # 不写 command/securityContext —— controller 会按 roleConfig.host 自动注入
+  roleConfig:
+    host:
+      defaultGateway: 10.0.1.1
   links:
     - uid: 1
       peer_pod: r1
@@ -115,21 +127,9 @@ spec:
       containers:
         - name: pod
           image: crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/yyc:host-debian
-          securityContext:
-            privileged: true
-          command:
-            - /bin/bash
-            - -c
-            - |
-              echo "waiting for host2_r1 to be created by vntopo-agent..."
-              for i in $(seq 1 60); do
-                if ip link show host2_r1 >/dev/null 2>&1; then break; fi
-                sleep 1
-              done
-              ip route replace default via 10.0.2.1 dev host2_r1 || true
-              echo "default route set, host2 ready"
-              ip a; ip route
-              sleep infinity
+  roleConfig:
+    host:
+      defaultGateway: 10.0.2.1
   links:
     - uid: 2
       peer_pod: r1
@@ -153,27 +153,19 @@ spec:
       containers:
         - name: pod
           image: crpi-lz7p74weyijj71uf.cn-beijing.personal.cr.aliyuncs.com/yyc20001209/yyc:firewall-v2
-          # privileged 是 frr 镜像的硬要求（要操作 raw socket / netlink）
-          securityContext:
-            privileged: true
-          command:
-            - /bin/bash
-            - -c
-            - |
-              # 开转发，让 r1 成为真正的路由器
-              echo 1 > /proc/sys/net/ipv4/ip_forward
-              # 等 vntopo-agent 把两条接口都建好（uid=1 上的 r1_host1，uid=2 上的 r1_host2）
-              echo "waiting for r1_host1 / r1_host2 to be created by vntopo-agent..."
-              for i in $(seq 1 60); do
-                if ip link show r1_host1 >/dev/null 2>&1 && ip link show r1_host2 >/dev/null 2>&1; then
-                  break
-                fi
-                sleep 1
-              done
-              echo "router interfaces ready:"
-              ip a; ip route
-              # 直连两段子网够用了，无需 OSPF。frr 不启动也不影响转发。
-              sleep infinity
+          # 不写 command/securityContext —— controller 会按 roleConfig.router 自动注入：
+          #   - command: 开 ip_forward + 启 frrinit.sh start + 等接口 + sleep
+          #   - securityContext.privileged: true
+          #   - volumeMount /etc/frr -> ConfigMap "r1-frr" (含 daemons + frr.conf + vtysh.conf)
+          #   - volumeMount /var/run/frr -> emptyDir
+  roleConfig:
+    router:
+      # OSPF 通告本路由器直连的两段子网
+      # 改这里 → controller 重渲染 ConfigMap → agent 自动 frrinit.sh restart（不重建 Pod）
+      ospfNetworks:
+        - 10.0.1.0/24
+        - 10.0.2.0/24
+      # routerId 不写时，controller 自动从 spec.links[0].local_ip 派生
   links:
     - uid: 1
       peer_pod: host1
